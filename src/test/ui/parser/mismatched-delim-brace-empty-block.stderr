@@ -1,0 +1,8 @@
+error: unexpected closing delimiter: `}`
+  --> $DIR/mismatched-delim-brace-empty-block.rs:5:1
+   |
+LL | }
+   | ^ unexpected closing delimiter
+
+error: aborting due to previous error
+

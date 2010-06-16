@@ -1,0 +1,63 @@
+error[E0401]: can't use generic parameters from outer function
+  --> $DIR/issue-65035-static-with-parent-generics.rs:6:26
+   |
+LL | fn f<T>() {
+   |      - type parameter from outer function
+LL |     extern "C" {
+LL |         static a: *const T;
+   |                          ^ use of generic parameter from outer function
+
+error[E0401]: can't use generic parameters from outer function
+  --> $DIR/issue-65035-static-with-parent-generics.rs:12:22
+   |
+LL | fn g<T: Default>() {
+   |      - type parameter from outer function
+LL |     static a: *const T = Default::default();
+   |                      ^ use of generic parameter from outer function
+
+error[E0401]: can't use generic parameters from outer function
+  --> $DIR/issue-65035-static-with-parent-generics.rs:18:24
+   |
+LL | fn h<const N: usize>() {
+   |            - const parameter from outer function
+LL |     extern "C" {
+LL |         static a: [u8; N];
+   |                        ^ use of generic parameter from outer function
+
+error[E0401]: can't use generic parameters from outer function
+  --> $DIR/issue-65035-static-with-parent-generics.rs:24:20
+   |
+LL | fn i<const N: usize>() {
+   |            - const parameter from outer function
+LL |     static a: [u8; N] = [0; N];
+   |                    ^ use of generic parameter from outer function
+
+error[E0401]: can't use generic parameters from outer function
+  --> $DIR/issue-65035-static-with-parent-generics.rs:24:29
+   |
+LL | fn i<const N: usize>() {
+   |            - const parameter from outer function
+LL |     static a: [u8; N] = [0; N];
+   |                             ^ use of generic parameter from outer function
+
+warning: the feature `const_generics` is incomplete and may cause the compiler to crash
+  --> $DIR/issue-65035-static-with-parent-generics.rs:1:12
+   |
+LL | #![feature(const_generics)]
+   |            ^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(incomplete_features)]` on by default
+
+error[E0308]: mismatched types
+  --> $DIR/issue-65035-static-with-parent-generics.rs:24:25
+   |
+LL |     static a: [u8; N] = [0; N];
+   |                         ^^^^^^ expected `N`, found `N`
+   |
+   = note: expected array `[u8; _]`
+              found array `[u8; _]`
+
+error: aborting due to 6 previous errors
+
+Some errors have detailed explanations: E0308, E0401.
+For more information about an error, try `rustc --explain E0308`.
