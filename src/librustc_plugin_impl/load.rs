@@ -1,12 +1,12 @@
 //! Used by `rustc` when loading a plugin.
 
 use crate::Registry;
-use rustc_ast::ast::{Crate, Ident};
+use rustc_ast::Crate;
 use rustc_errors::struct_span_err;
 use rustc_metadata::locator;
 use rustc_middle::middle::cstore::MetadataLoader;
 use rustc_session::Session;
-use rustc_span::symbol::sym;
+use rustc_span::symbol::{sym, Ident};
 use rustc_span::Span;
 
 use std::borrow::ToOwned;
@@ -32,7 +32,7 @@ pub fn load_plugins(
     let mut plugins = Vec::new();
 
     for attr in &krate.attrs {
-        if !attr.check_name(sym::plugin) {
+        if !sess.check_name(attr, sym::plugin) {
             continue;
         }
 
@@ -55,13 +55,11 @@ fn load_plugin(
     metadata_loader: &dyn MetadataLoader,
     ident: Ident,
 ) {
-    let registrar = locator::find_plugin_registrar(sess, metadata_loader, ident.span, ident.name);
-
-    if let Some((lib, disambiguator)) = registrar {
-        let symbol = sess.generate_plugin_registrar_symbol(disambiguator);
-        let fun = dylink_registrar(sess, ident.span, lib, symbol);
-        plugins.push(fun);
-    }
+    let (lib, disambiguator) =
+        locator::find_plugin_registrar(sess, metadata_loader, ident.span, ident.name);
+    let symbol = sess.generate_plugin_registrar_symbol(disambiguator);
+    let fun = dylink_registrar(sess, ident.span, lib, symbol);
+    plugins.push(fun);
 }
 
 // Dynamically link a registrar function into the compiler process.
@@ -76,7 +74,7 @@ fn dylink_registrar(
     // Make sure the path contains a / or the linker will search for it.
     let path = env::current_dir().unwrap().join(&path);
 
-    let lib = match DynamicLibrary::open(Some(&path)) {
+    let lib = match DynamicLibrary::open(&path) {
         Ok(lib) => lib,
         // this is fatal: there are almost certainly macros we need
         // inside this crate, so continue would spew "macro undefined"

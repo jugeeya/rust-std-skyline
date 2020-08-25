@@ -6,7 +6,6 @@ use crate::type_::Type;
 use crate::type_of::LayoutLlvmExt;
 use crate::value::Value;
 use libc::{c_char, c_uint};
-use log::debug;
 use rustc_codegen_ssa::base::to_immediate;
 use rustc_codegen_ssa::common::{IntPredicate, RealPredicate, TypeKind};
 use rustc_codegen_ssa::mir::operand::{OperandRef, OperandValue};
@@ -18,7 +17,7 @@ use rustc_data_structures::small_c_str::SmallCStr;
 use rustc_hir::def_id::DefId;
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::{self, Ty, TyCtxt};
-use rustc_session::config::{self, Sanitizer};
+use rustc_span::sym;
 use rustc_target::abi::{self, Align, Size};
 use rustc_target::spec::{HasTargetSpec, Target};
 use std::borrow::Cow;
@@ -26,6 +25,7 @@ use std::ffi::CStr;
 use std::iter::TrustedLen;
 use std::ops::{Deref, Range};
 use std::ptr;
+use tracing::debug;
 
 // All Builders must have an llfn associated with them
 #[must_use]
@@ -303,14 +303,14 @@ impl BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         lhs: Self::Value,
         rhs: Self::Value,
     ) -> (Self::Value, Self::Value) {
-        use rustc_ast::ast::IntTy::*;
-        use rustc_ast::ast::UintTy::*;
+        use rustc_ast::IntTy::*;
+        use rustc_ast::UintTy::*;
         use rustc_middle::ty::{Int, Uint};
 
         let new_kind = match ty.kind {
             Int(t @ Isize) => Int(t.normalize(self.tcx.sess.target.ptr_width)),
             Uint(t @ Usize) => Uint(t.normalize(self.tcx.sess.target.ptr_width)),
-            ref t @ Uint(_) | ref t @ Int(_) => t.clone(),
+            ref t @ (Uint(_) | Int(_)) => t.clone(),
             _ => panic!("tried to get overflow intrinsic for op applied to non-int type"),
         };
 
@@ -653,11 +653,124 @@ impl BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         unsafe { llvm::LLVMBuildSExt(self.llbuilder, val, dest_ty, UNNAMED) }
     }
 
+    fn fptoui_sat(&mut self, val: &'ll Value, dest_ty: &'ll Type) -> Option<&'ll Value> {
+        // WebAssembly has saturating floating point to integer casts if the
+        // `nontrapping-fptoint` target feature is activated. We'll use those if
+        // they are available.
+        if self.sess().target.target.arch == "wasm32"
+            && self.sess().target_features.contains(&sym::nontrapping_dash_fptoint)
+        {
+            let src_ty = self.cx.val_ty(val);
+            let float_width = self.cx.float_width(src_ty);
+            let int_width = self.cx.int_width(dest_ty);
+            let name = match (int_width, float_width) {
+                (32, 32) => Some("llvm.wasm.trunc.saturate.unsigned.i32.f32"),
+                (32, 64) => Some("llvm.wasm.trunc.saturate.unsigned.i32.f64"),
+                (64, 32) => Some("llvm.wasm.trunc.saturate.unsigned.i64.f32"),
+                (64, 64) => Some("llvm.wasm.trunc.saturate.unsigned.i64.f64"),
+                _ => None,
+            };
+            if let Some(name) = name {
+                let intrinsic = self.get_intrinsic(name);
+                return Some(self.call(intrinsic, &[val], None));
+            }
+        }
+        None
+    }
+
+    fn fptosi_sat(&mut self, val: &'ll Value, dest_ty: &'ll Type) -> Option<&'ll Value> {
+        // WebAssembly has saturating floating point to integer casts if the
+        // `nontrapping-fptoint` target feature is activated. We'll use those if
+        // they are available.
+        if self.sess().target.target.arch == "wasm32"
+            && self.sess().target_features.contains(&sym::nontrapping_dash_fptoint)
+        {
+            let src_ty = self.cx.val_ty(val);
+            let float_width = self.cx.float_width(src_ty);
+            let int_width = self.cx.int_width(dest_ty);
+            let name = match (int_width, float_width) {
+                (32, 32) => Some("llvm.wasm.trunc.saturate.signed.i32.f32"),
+                (32, 64) => Some("llvm.wasm.trunc.saturate.signed.i32.f64"),
+                (64, 32) => Some("llvm.wasm.trunc.saturate.signed.i64.f32"),
+                (64, 64) => Some("llvm.wasm.trunc.saturate.signed.i64.f64"),
+                _ => None,
+            };
+            if let Some(name) = name {
+                let intrinsic = self.get_intrinsic(name);
+                return Some(self.call(intrinsic, &[val], None));
+            }
+        }
+        None
+    }
+
+    fn fptosui_may_trap(&self, val: &'ll Value, dest_ty: &'ll Type) -> bool {
+        // Most of the time we'll be generating the `fptosi` or `fptoui`
+        // instruction for floating-point-to-integer conversions. These
+        // instructions by definition in LLVM do not trap. For the WebAssembly
+        // target, however, we'll lower in some cases to intrinsic calls instead
+        // which may trap. If we detect that this is a situation where we'll be
+        // using the intrinsics then we report that the call map trap, which
+        // callers might need to handle.
+        if !self.wasm_and_missing_nontrapping_fptoint() {
+            return false;
+        }
+        let src_ty = self.cx.val_ty(val);
+        let float_width = self.cx.float_width(src_ty);
+        let int_width = self.cx.int_width(dest_ty);
+        match (int_width, float_width) {
+            (32, 32) | (32, 64) | (64, 32) | (64, 64) => true,
+            _ => false,
+        }
+    }
+
     fn fptoui(&mut self, val: &'ll Value, dest_ty: &'ll Type) -> &'ll Value {
+        // When we can, use the native wasm intrinsics which have tighter
+        // codegen. Note that this has a semantic difference in that the
+        // intrinsic can trap whereas `fptoui` never traps. That difference,
+        // however, is handled by `fptosui_may_trap` above.
+        //
+        // Note that we skip the wasm intrinsics for vector types where `fptoui`
+        // must be used instead.
+        if self.wasm_and_missing_nontrapping_fptoint() {
+            let src_ty = self.cx.val_ty(val);
+            if self.cx.type_kind(src_ty) != TypeKind::Vector {
+                let float_width = self.cx.float_width(src_ty);
+                let int_width = self.cx.int_width(dest_ty);
+                let name = match (int_width, float_width) {
+                    (32, 32) => Some("llvm.wasm.trunc.unsigned.i32.f32"),
+                    (32, 64) => Some("llvm.wasm.trunc.unsigned.i32.f64"),
+                    (64, 32) => Some("llvm.wasm.trunc.unsigned.i64.f32"),
+                    (64, 64) => Some("llvm.wasm.trunc.unsigned.i64.f64"),
+                    _ => None,
+                };
+                if let Some(name) = name {
+                    let intrinsic = self.get_intrinsic(name);
+                    return self.call(intrinsic, &[val], None);
+                }
+            }
+        }
         unsafe { llvm::LLVMBuildFPToUI(self.llbuilder, val, dest_ty, UNNAMED) }
     }
 
     fn fptosi(&mut self, val: &'ll Value, dest_ty: &'ll Type) -> &'ll Value {
+        if self.wasm_and_missing_nontrapping_fptoint() {
+            let src_ty = self.cx.val_ty(val);
+            if self.cx.type_kind(src_ty) != TypeKind::Vector {
+                let float_width = self.cx.float_width(src_ty);
+                let int_width = self.cx.int_width(dest_ty);
+                let name = match (int_width, float_width) {
+                    (32, 32) => Some("llvm.wasm.trunc.signed.i32.f32"),
+                    (32, 64) => Some("llvm.wasm.trunc.signed.i32.f64"),
+                    (64, 32) => Some("llvm.wasm.trunc.signed.i64.f32"),
+                    (64, 64) => Some("llvm.wasm.trunc.signed.i64.f64"),
+                    _ => None,
+                };
+                if let Some(name) = name {
+                    let intrinsic = self.get_intrinsic(name);
+                    return self.call(intrinsic, &[val], None);
+                }
+            }
+        }
         unsafe { llvm::LLVMBuildFPToSI(self.llbuilder, val, dest_ty, UNNAMED) }
     }
 
@@ -998,6 +1111,33 @@ impl BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         self.call_lifetime_intrinsic("llvm.lifetime.end.p0i8", ptr, size);
     }
 
+    fn instrprof_increment(
+        &mut self,
+        fn_name: &'ll Value,
+        hash: &'ll Value,
+        num_counters: &'ll Value,
+        index: &'ll Value,
+    ) {
+        debug!(
+            "instrprof_increment() with args ({:?}, {:?}, {:?}, {:?})",
+            fn_name, hash, num_counters, index
+        );
+
+        let llfn = unsafe { llvm::LLVMRustGetInstrProfIncrementIntrinsic(self.cx().llmod) };
+        let args = &[fn_name, hash, num_counters, index];
+        let args = self.check_call("call", llfn, args);
+
+        unsafe {
+            let _ = llvm::LLVMRustBuildCall(
+                self.llbuilder,
+                llfn,
+                args.as_ptr() as *const &llvm::Value,
+                args.len() as c_uint,
+                None,
+            );
+        }
+    }
+
     fn call(
         &mut self,
         llfn: &'ll Value,
@@ -1243,14 +1383,7 @@ impl Builder<'a, 'll, 'tcx> {
             return;
         }
 
-        let opts = &self.cx.sess().opts;
-        let emit = match opts.debugging_opts.sanitizer {
-            // Some sanitizer use lifetime intrinsics. When they are in use,
-            // emit lifetime intrinsics regardless of optimization level.
-            Some(Sanitizer::Address) | Some(Sanitizer::Memory) => true,
-            _ => opts.optimize != config::OptLevel::No,
-        };
-        if !emit {
+        if !self.cx().sess().emit_lifetime_markers() {
             return;
         }
 
@@ -1260,7 +1393,12 @@ impl Builder<'a, 'll, 'tcx> {
         self.call(lifetime_intrinsic, &[self.cx.const_u64(size), ptr], None);
     }
 
-    fn phi(&mut self, ty: &'ll Type, vals: &[&'ll Value], bbs: &[&'ll BasicBlock]) -> &'ll Value {
+    pub(crate) fn phi(
+        &mut self,
+        ty: &'ll Type,
+        vals: &[&'ll Value],
+        bbs: &[&'ll BasicBlock],
+    ) -> &'ll Value {
         assert_eq!(vals.len(), bbs.len());
         let phi = unsafe { llvm::LLVMBuildPhi(self.llbuilder, ty, UNNAMED) };
         unsafe {
@@ -1273,5 +1411,10 @@ impl Builder<'a, 'll, 'tcx> {
         unsafe {
             llvm::LLVMAddIncoming(phi, &val, &bb, 1 as c_uint);
         }
+    }
+
+    fn wasm_and_missing_nontrapping_fptoint(&self) -> bool {
+        self.sess().target.target.arch == "wasm32"
+            && !self.sess().target_features.contains(&sym::nontrapping_dash_fptoint)
     }
 }

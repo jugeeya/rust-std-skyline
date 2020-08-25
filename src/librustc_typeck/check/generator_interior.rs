@@ -4,7 +4,7 @@
 //! types computed here.
 
 use super::FnCtxt;
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_data_structures::fx::{FxHashSet, FxIndexSet};
 use rustc_hir as hir;
 use rustc_hir::def::{CtorKind, DefKind, Res};
 use rustc_hir::def_id::DefId;
@@ -16,7 +16,7 @@ use rustc_span::Span;
 
 struct InteriorVisitor<'a, 'tcx> {
     fcx: &'a FnCtxt<'a, 'tcx>,
-    types: FxHashMap<ty::GeneratorInteriorTypeCause<'tcx>, usize>,
+    types: FxIndexSet<ty::GeneratorInteriorTypeCause<'tcx>>,
     region_scope_tree: &'tcx region::ScopeTree,
     expr_count: usize,
     kind: hir::GeneratorKind,
@@ -88,17 +88,15 @@ impl<'a, 'tcx> InteriorVisitor<'a, 'tcx> {
                     .span_note(yield_data.span, &*note)
                     .emit();
             } else {
-                // Map the type to the number of types added before it
-                let entries = self.types.len();
+                // Insert the type into the ordered set.
                 let scope_span = scope.map(|s| s.span(self.fcx.tcx, self.region_scope_tree));
-                self.types
-                    .entry(ty::GeneratorInteriorTypeCause {
-                        span: source_span,
-                        ty: &ty,
-                        scope_span,
-                        expr: expr.map(|e| e.hir_id),
-                    })
-                    .or_insert(entries);
+                self.types.insert(ty::GeneratorInteriorTypeCause {
+                    span: source_span,
+                    ty: &ty,
+                    scope_span,
+                    yield_span: yield_data.span,
+                    expr: expr.map(|e| e.hir_id),
+                });
             }
         } else {
             debug!(
@@ -131,7 +129,7 @@ pub fn resolve_interior<'a, 'tcx>(
     let body = fcx.tcx.hir().body(body_id);
     let mut visitor = InteriorVisitor {
         fcx,
-        types: FxHashMap::default(),
+        types: FxIndexSet::default(),
         region_scope_tree: fcx.tcx.region_scope_tree(def_id),
         expr_count: 0,
         kind,
@@ -143,10 +141,8 @@ pub fn resolve_interior<'a, 'tcx>(
     let region_expr_count = visitor.region_scope_tree.body_expr_count(body_id).unwrap();
     assert_eq!(region_expr_count, visitor.expr_count);
 
-    let mut types: Vec<_> = visitor.types.drain().collect();
-
-    // Sort types by insertion order
-    types.sort_by_key(|t| t.1);
+    // The types are already kept in insertion order.
+    let types = visitor.types;
 
     // The types in the generator interior contain lifetimes local to the generator itself,
     // which should not be exposed outside of the generator. Therefore, we replace these
@@ -163,7 +159,7 @@ pub fn resolve_interior<'a, 'tcx>(
     let mut captured_tys = FxHashSet::default();
     let type_causes: Vec<_> = types
         .into_iter()
-        .filter_map(|(mut cause, _)| {
+        .filter_map(|mut cause| {
             // Erase regions and canonicalize late-bound regions to deduplicate as many types as we
             // can.
             let erased = fcx.tcx.erase_regions(&cause.ty);
@@ -189,8 +185,8 @@ pub fn resolve_interior<'a, 'tcx>(
     let type_list = fcx.tcx.mk_type_list(type_causes.iter().map(|cause| cause.ty));
     let witness = fcx.tcx.mk_generator_witness(ty::Binder::bind(type_list));
 
-    // Store the generator types and spans into the tables for this generator.
-    visitor.fcx.inh.tables.borrow_mut().generator_interior_types = type_causes;
+    // Store the generator types and spans into the typeck results for this generator.
+    visitor.fcx.inh.typeck_results.borrow_mut().generator_interior_types = type_causes;
 
     debug!(
         "types in generator after region replacement {:?}, span = {:?}",
@@ -221,7 +217,7 @@ impl<'a, 'tcx> Visitor<'tcx> for InteriorVisitor<'a, 'tcx> {
 
         if let PatKind::Binding(..) = pat.kind {
             let scope = self.region_scope_tree.var_scope(pat.hir_id.local_id);
-            let ty = self.fcx.tables.borrow().pat_ty(pat);
+            let ty = self.fcx.typeck_results.borrow().pat_ty(pat);
             self.record(ty, Some(scope), None, pat.span);
         }
     }
@@ -230,14 +226,15 @@ impl<'a, 'tcx> Visitor<'tcx> for InteriorVisitor<'a, 'tcx> {
         match &expr.kind {
             ExprKind::Call(callee, args) => match &callee.kind {
                 ExprKind::Path(qpath) => {
-                    let res = self.fcx.tables.borrow().qpath_res(qpath, callee.hir_id);
+                    let res = self.fcx.typeck_results.borrow().qpath_res(qpath, callee.hir_id);
                     match res {
                         // Direct calls never need to keep the callee `ty::FnDef`
                         // ZST in a temporary, so skip its type, just in case it
                         // can significantly complicate the generator type.
-                        Res::Def(DefKind::Fn, _)
-                        | Res::Def(DefKind::AssocFn, _)
-                        | Res::Def(DefKind::Ctor(_, CtorKind::Fn), _) => {
+                        Res::Def(
+                            DefKind::Fn | DefKind::AssocFn | DefKind::Ctor(_, CtorKind::Fn),
+                            _,
+                        ) => {
                             // NOTE(eddyb) this assumes a path expression has
                             // no nested expressions to keep track of.
                             self.expr_count += 1;
@@ -261,7 +258,7 @@ impl<'a, 'tcx> Visitor<'tcx> for InteriorVisitor<'a, 'tcx> {
 
         // If there are adjustments, then record the final type --
         // this is the actual value that is being produced.
-        if let Some(adjusted_ty) = self.fcx.tables.borrow().expr_ty_adjusted_opt(expr) {
+        if let Some(adjusted_ty) = self.fcx.typeck_results.borrow().expr_ty_adjusted_opt(expr) {
             self.record(adjusted_ty, scope, Some(expr), expr.span);
         }
 
@@ -289,7 +286,7 @@ impl<'a, 'tcx> Visitor<'tcx> for InteriorVisitor<'a, 'tcx> {
         //
         // The type table might not have information for this expression
         // if it is in a malformed scope. (#66387)
-        if let Some(ty) = self.fcx.tables.borrow().expr_ty_opt(expr) {
+        if let Some(ty) = self.fcx.typeck_results.borrow().expr_ty_opt(expr) {
             self.record(ty, scope, Some(expr), expr.span);
         } else {
             self.fcx.tcx.sess.delay_span_bug(expr.span, "no type for node");

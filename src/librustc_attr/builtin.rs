@@ -1,16 +1,16 @@
 //! Parsing and validation of builtin attributes
 
-use super::{find_by_name, mark_used};
-
-use rustc_ast::ast::{self, Attribute, MetaItem, MetaItemKind, NestedMetaItem};
+use rustc_ast::{self as ast, Attribute, Lit, LitKind, MetaItem, MetaItemKind, NestedMetaItem};
 use rustc_ast_pretty::pprust;
-use rustc_errors::{struct_span_err, Applicability, Handler};
+use rustc_errors::{struct_span_err, Applicability};
 use rustc_feature::{find_gated_cfg, is_builtin_attr_name, Features, GatedCfg};
 use rustc_macros::HashStable_Generic;
 use rustc_session::parse::{feature_err, ParseSess};
+use rustc_session::Session;
 use rustc_span::hygiene::Transparency;
 use rustc_span::{symbol::sym, symbol::Symbol, Span};
 use std::num::NonZeroU32;
+use version_check::Version;
 
 pub fn is_builtin_attr(attr: &Attribute) -> bool {
     attr.is_doc_comment() || attr.ident().filter(|ident| is_builtin_attr_name(ident.name)).is_some()
@@ -20,6 +20,7 @@ enum AttrError {
     MultipleItem(String),
     UnknownMetaItem(String, &'static [&'static str]),
     MissingSince,
+    NonIdentFeature,
     MissingFeature,
     MultipleStabilityLevels,
     UnsupportedLiteral(&'static str, /* is_bytestr */ bool),
@@ -39,6 +40,9 @@ fn handle_errors(sess: &ParseSess, span: Span, error: AttrError) {
         }
         AttrError::MissingSince => {
             struct_span_err!(diag, span, E0542, "missing 'since'").emit();
+        }
+        AttrError::NonIdentFeature => {
+            struct_span_err!(diag, span, E0546, "'feature' is not an identifier").emit();
         }
         AttrError::MissingFeature => {
             struct_span_err!(diag, span, E0546, "missing 'feature'").emit();
@@ -63,7 +67,7 @@ fn handle_errors(sess: &ParseSess, span: Span, error: AttrError) {
     }
 }
 
-#[derive(Clone, PartialEq, RustcEncodable, RustcDecodable)]
+#[derive(Clone, PartialEq, Encodable, Decodable)]
 pub enum InlineAttr {
     None,
     Hint,
@@ -71,7 +75,7 @@ pub enum InlineAttr {
     Never,
 }
 
-#[derive(Clone, RustcEncodable, RustcDecodable)]
+#[derive(Clone, Encodable, Decodable)]
 pub enum OptimizeAttr {
     None,
     Speed,
@@ -85,32 +89,35 @@ pub enum UnwindAttr {
 }
 
 /// Determine what `#[unwind]` attribute is present in `attrs`, if any.
-pub fn find_unwind_attr(diagnostic: Option<&Handler>, attrs: &[Attribute]) -> Option<UnwindAttr> {
+pub fn find_unwind_attr(sess: &Session, attrs: &[Attribute]) -> Option<UnwindAttr> {
     attrs.iter().fold(None, |ia, attr| {
-        if attr.check_name(sym::unwind) {
+        if sess.check_name(attr, sym::unwind) {
             if let Some(meta) = attr.meta() {
                 if let MetaItemKind::List(items) = meta.kind {
                     if items.len() == 1 {
-                        if items[0].check_name(sym::allowed) {
+                        if items[0].has_name(sym::allowed) {
                             return Some(UnwindAttr::Allowed);
-                        } else if items[0].check_name(sym::aborts) {
+                        } else if items[0].has_name(sym::aborts) {
                             return Some(UnwindAttr::Aborts);
                         }
                     }
 
-                    diagnostic.map(|d| {
-                        struct_span_err!(d, attr.span, E0633, "malformed `unwind` attribute input")
-                            .span_label(attr.span, "invalid argument")
-                            .span_suggestions(
-                                attr.span,
-                                "the allowed arguments are `allowed` and `aborts`",
-                                (vec!["allowed", "aborts"])
-                                    .into_iter()
-                                    .map(|s| format!("#[unwind({})]", s)),
-                                Applicability::MachineApplicable,
-                            )
-                            .emit();
-                    });
+                    struct_span_err!(
+                        sess.diagnostic(),
+                        attr.span,
+                        E0633,
+                        "malformed `unwind` attribute input"
+                    )
+                    .span_label(attr.span, "invalid argument")
+                    .span_suggestions(
+                        attr.span,
+                        "the allowed arguments are `allowed` and `aborts`",
+                        (vec!["allowed", "aborts"])
+                            .into_iter()
+                            .map(|s| format!("#[unwind({})]", s)),
+                        Applicability::MachineApplicable,
+                    )
+                    .emit();
                 }
             }
         }
@@ -119,17 +126,19 @@ pub fn find_unwind_attr(diagnostic: Option<&Handler>, attrs: &[Attribute]) -> Op
     })
 }
 
-/// Represents the #[stable], #[unstable], #[rustc_deprecated] attributes.
-#[derive(RustcEncodable, RustcDecodable, Copy, Clone, Debug, PartialEq, Eq, Hash)]
+/// Represents the following attributes:
+///
+/// - `#[stable]`
+/// - `#[unstable]`
+#[derive(Encodable, Decodable, Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[derive(HashStable_Generic)]
 pub struct Stability {
     pub level: StabilityLevel,
     pub feature: Symbol,
-    pub rustc_depr: Option<RustcDeprecation>,
 }
 
-/// Represents the #[rustc_const_unstable] and #[rustc_const_stable] attributes.
-#[derive(RustcEncodable, RustcDecodable, Copy, Clone, Debug, PartialEq, Eq, Hash)]
+/// Represents the `#[rustc_const_unstable]` and `#[rustc_const_stable]` attributes.
+#[derive(Encodable, Decodable, Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[derive(HashStable_Generic)]
 pub struct ConstStability {
     pub level: StabilityLevel,
@@ -141,7 +150,7 @@ pub struct ConstStability {
 }
 
 /// The available stability levels.
-#[derive(RustcEncodable, RustcDecodable, PartialEq, PartialOrd, Copy, Clone, Debug, Eq, Hash)]
+#[derive(Encodable, Decodable, PartialEq, PartialOrd, Copy, Clone, Debug, Eq, Hash)]
 #[derive(HashStable_Generic)]
 pub enum StabilityLevel {
     // Reason for the current stability level and the relevant rust-lang issue
@@ -158,31 +167,10 @@ impl StabilityLevel {
     }
 }
 
-#[derive(RustcEncodable, RustcDecodable, PartialEq, PartialOrd, Copy, Clone, Debug, Eq, Hash)]
-#[derive(HashStable_Generic)]
-pub struct RustcDeprecation {
-    pub since: Symbol,
-    pub reason: Symbol,
-    /// A text snippet used to completely replace any use of the deprecated item in an expression.
-    pub suggestion: Option<Symbol>,
-}
-
-/// Checks if `attrs` contains an attribute like `#![feature(feature_name)]`.
-/// This will not perform any "sanity checks" on the form of the attributes.
-pub fn contains_feature_attr(attrs: &[Attribute], feature_name: Symbol) -> bool {
-    attrs.iter().any(|item| {
-        item.check_name(sym::feature)
-            && item
-                .meta_item_list()
-                .map(|list| list.iter().any(|mi| mi.is_word() && mi.check_name(feature_name)))
-                .unwrap_or(false)
-    })
-}
-
 /// Collects stability info from all stability attributes in `attrs`.
 /// Returns `None` if no stability attributes are found.
 pub fn find_stability(
-    sess: &ParseSess,
+    sess: &Session,
     attrs: &[Attribute],
     item_sp: Span,
 ) -> (Option<Stability>, Option<ConstStability>) {
@@ -190,7 +178,7 @@ pub fn find_stability(
 }
 
 fn find_stability_generic<'a, I>(
-    sess: &ParseSess,
+    sess: &Session,
     attrs_iter: I,
     item_sp: Span,
 ) -> (Option<Stability>, Option<ConstStability>)
@@ -200,15 +188,13 @@ where
     use StabilityLevel::*;
 
     let mut stab: Option<Stability> = None;
-    let mut rustc_depr: Option<RustcDeprecation> = None;
     let mut const_stab: Option<ConstStability> = None;
     let mut promotable = false;
     let mut allow_const_fn_ptr = false;
-    let diagnostic = &sess.span_diagnostic;
+    let diagnostic = &sess.parse_sess.span_diagnostic;
 
     'outer: for attr in attrs_iter {
         if ![
-            sym::rustc_deprecated,
             sym::rustc_const_unstable,
             sym::rustc_const_stable,
             sym::unstable,
@@ -222,7 +208,7 @@ where
             continue; // not a stability level
         }
 
-        mark_used(attr);
+        sess.mark_attr_used(attr);
 
         let meta = attr.meta();
 
@@ -238,7 +224,7 @@ where
             let get = |meta: &MetaItem, item: &mut Option<Symbol>| {
                 if item.is_some() {
                     handle_errors(
-                        sess,
+                        &sess.parse_sess,
                         meta.span,
                         AttrError::MultipleItem(pprust::path_to_string(&meta.path)),
                     );
@@ -253,82 +239,22 @@ where
                 }
             };
 
-            macro_rules! get_meta {
-                ($($name:ident),+) => {
-                    $(
-                        let mut $name = None;
-                    )+
-                    for meta in metas {
-                        if let Some(mi) = meta.meta_item() {
-                            match mi.name_or_empty() {
-                                $(
-                                    sym::$name => if !get(mi, &mut $name) { continue 'outer },
-                                )+
-                                _ => {
-                                    let expected = &[ $( stringify!($name) ),+ ];
-                                    handle_errors(
-                                        sess,
-                                        mi.span,
-                                        AttrError::UnknownMetaItem(
-                                            pprust::path_to_string(&mi.path),
-                                            expected,
-                                        ),
-                                    );
-                                    continue 'outer
-                                }
-                            }
-                        } else {
-                            handle_errors(
-                                sess,
-                                meta.span(),
-                                AttrError::UnsupportedLiteral(
-                                    "unsupported literal",
-                                    false,
-                                ),
-                            );
-                            continue 'outer
-                        }
-                    }
-                }
-            }
-
             let meta_name = meta.name_or_empty();
             match meta_name {
-                sym::rustc_deprecated => {
-                    if rustc_depr.is_some() {
-                        struct_span_err!(
-                            diagnostic,
-                            item_sp,
-                            E0540,
-                            "multiple rustc_deprecated attributes"
-                        )
-                        .emit();
-                        continue 'outer;
-                    }
-
-                    get_meta!(since, reason, suggestion);
-
-                    match (since, reason) {
-                        (Some(since), Some(reason)) => {
-                            rustc_depr = Some(RustcDeprecation { since, reason, suggestion })
-                        }
-                        (None, _) => {
-                            handle_errors(sess, attr.span, AttrError::MissingSince);
-                            continue;
-                        }
-                        _ => {
-                            struct_span_err!(diagnostic, attr.span, E0543, "missing 'reason'")
-                                .emit();
-                            continue;
-                        }
-                    }
-                }
                 sym::rustc_const_unstable | sym::unstable => {
                     if meta_name == sym::unstable && stab.is_some() {
-                        handle_errors(sess, attr.span, AttrError::MultipleStabilityLevels);
+                        handle_errors(
+                            &sess.parse_sess,
+                            attr.span,
+                            AttrError::MultipleStabilityLevels,
+                        );
                         break;
                     } else if meta_name == sym::rustc_const_unstable && const_stab.is_some() {
-                        handle_errors(sess, attr.span, AttrError::MultipleStabilityLevels);
+                        handle_errors(
+                            &sess.parse_sess,
+                            attr.span,
+                            AttrError::MultipleStabilityLevels,
+                        );
                         break;
                     }
 
@@ -394,13 +320,13 @@ where
                                 sym::soft => {
                                     if !mi.is_word() {
                                         let msg = "`soft` should not have any arguments";
-                                        sess.span_diagnostic.span_err(mi.span, msg);
+                                        sess.parse_sess.span_diagnostic.span_err(mi.span, msg);
                                     }
                                     is_soft = true;
                                 }
                                 _ => {
                                     handle_errors(
-                                        sess,
+                                        &sess.parse_sess,
                                         meta.span(),
                                         AttrError::UnknownMetaItem(
                                             pprust::path_to_string(&mi.path),
@@ -412,7 +338,7 @@ where
                             }
                         } else {
                             handle_errors(
-                                sess,
+                                &sess.parse_sess,
                                 meta.span(),
                                 AttrError::UnsupportedLiteral("unsupported literal", false),
                             );
@@ -422,9 +348,17 @@ where
 
                     match (feature, reason, issue) {
                         (Some(feature), reason, Some(_)) => {
+                            if !rustc_lexer::is_ident(&feature.as_str()) {
+                                handle_errors(
+                                    &sess.parse_sess,
+                                    attr.span,
+                                    AttrError::NonIdentFeature,
+                                );
+                                continue;
+                            }
                             let level = Unstable { reason, issue: issue_num, is_soft };
                             if sym::unstable == meta_name {
-                                stab = Some(Stability { level, feature, rustc_depr: None });
+                                stab = Some(Stability { level, feature });
                             } else {
                                 const_stab = Some(ConstStability {
                                     level,
@@ -435,7 +369,7 @@ where
                             }
                         }
                         (None, _, _) => {
-                            handle_errors(sess, attr.span, AttrError::MissingFeature);
+                            handle_errors(&sess.parse_sess, attr.span, AttrError::MissingFeature);
                             continue;
                         }
                         _ => {
@@ -447,10 +381,18 @@ where
                 }
                 sym::rustc_const_stable | sym::stable => {
                     if meta_name == sym::stable && stab.is_some() {
-                        handle_errors(sess, attr.span, AttrError::MultipleStabilityLevels);
+                        handle_errors(
+                            &sess.parse_sess,
+                            attr.span,
+                            AttrError::MultipleStabilityLevels,
+                        );
                         break;
                     } else if meta_name == sym::rustc_const_stable && const_stab.is_some() {
-                        handle_errors(sess, attr.span, AttrError::MultipleStabilityLevels);
+                        handle_errors(
+                            &sess.parse_sess,
+                            attr.span,
+                            AttrError::MultipleStabilityLevels,
+                        );
                         break;
                     }
 
@@ -471,7 +413,7 @@ where
                                 }
                                 _ => {
                                     handle_errors(
-                                        sess,
+                                        &sess.parse_sess,
                                         meta.span(),
                                         AttrError::UnknownMetaItem(
                                             pprust::path_to_string(&mi.path),
@@ -483,7 +425,7 @@ where
                             },
                             NestedMetaItem::Literal(lit) => {
                                 handle_errors(
-                                    sess,
+                                    &sess.parse_sess,
                                     lit.span,
                                     AttrError::UnsupportedLiteral("unsupported literal", false),
                                 );
@@ -496,7 +438,7 @@ where
                         (Some(feature), Some(since)) => {
                             let level = Stable { since };
                             if sym::stable == meta_name {
-                                stab = Some(Stability { level, feature, rustc_depr: None });
+                                stab = Some(Stability { level, feature });
                             } else {
                                 const_stab = Some(ConstStability {
                                     level,
@@ -507,33 +449,17 @@ where
                             }
                         }
                         (None, _) => {
-                            handle_errors(sess, attr.span, AttrError::MissingFeature);
+                            handle_errors(&sess.parse_sess, attr.span, AttrError::MissingFeature);
                             continue;
                         }
                         _ => {
-                            handle_errors(sess, attr.span, AttrError::MissingSince);
+                            handle_errors(&sess.parse_sess, attr.span, AttrError::MissingSince);
                             continue;
                         }
                     }
                 }
                 _ => unreachable!(),
             }
-        }
-    }
-
-    // Merge the deprecation info into the stability info
-    if let Some(rustc_depr) = rustc_depr {
-        if let Some(ref mut stab) = stab {
-            stab.rustc_depr = Some(rustc_depr);
-        } else {
-            struct_span_err!(
-                diagnostic,
-                item_sp,
-                E0549,
-                "rustc_deprecated attribute must be paired with \
-                       either stable or unstable attribute"
-            )
-            .emit();
         }
     }
 
@@ -558,17 +484,14 @@ where
     (stab, const_stab)
 }
 
-pub fn find_crate_name(attrs: &[Attribute]) -> Option<Symbol> {
-    super::first_attr_value_str_by_name(attrs, sym::crate_name)
+pub fn find_crate_name(sess: &Session, attrs: &[Attribute]) -> Option<Symbol> {
+    sess.first_attr_value_str_by_name(attrs, sym::crate_name)
 }
 
 /// Tests if a cfg-pattern matches the cfg set
 pub fn cfg_matches(cfg: &ast::MetaItem, sess: &ParseSess, features: Option<&Features>) -> bool {
-    eval_condition(cfg, sess, &mut |cfg| {
-        let gate = find_gated_cfg(|sym| cfg.check_name(sym));
-        if let (Some(feats), Some(gated_cfg)) = (features, gate) {
-            gate_cfg(&gated_cfg, cfg.span, sess, feats);
-        }
+    eval_condition(cfg, sess, features, &mut |cfg| {
+        try_gate_cfg(cfg, sess, features);
         let error = |span, msg| {
             sess.span_diagnostic.span_err(span, msg);
             true
@@ -599,6 +522,13 @@ pub fn cfg_matches(cfg: &ast::MetaItem, sess: &ParseSess, features: Option<&Feat
     })
 }
 
+fn try_gate_cfg(cfg: &ast::MetaItem, sess: &ParseSess, features: Option<&Features>) {
+    let gate = find_gated_cfg(|sym| cfg.has_name(sym));
+    if let (Some(feats), Some(gated_cfg)) = (features, gate) {
+        gate_cfg(&gated_cfg, cfg.span, sess, feats);
+    }
+}
+
 fn gate_cfg(gated_cfg: &GatedCfg, cfg_span: Span, sess: &ParseSess, features: &Features) {
     let (cfg, feature, has_feature) = gated_cfg;
     if !has_feature(features) && !cfg_span.allows_unstable(*feature) {
@@ -612,9 +542,44 @@ fn gate_cfg(gated_cfg: &GatedCfg, cfg_span: Span, sess: &ParseSess, features: &F
 pub fn eval_condition(
     cfg: &ast::MetaItem,
     sess: &ParseSess,
+    features: Option<&Features>,
     eval: &mut impl FnMut(&ast::MetaItem) -> bool,
 ) -> bool {
     match cfg.kind {
+        ast::MetaItemKind::List(ref mis) if cfg.name_or_empty() == sym::version => {
+            try_gate_cfg(cfg, sess, features);
+            let (min_version, span) = match &mis[..] {
+                [NestedMetaItem::Literal(Lit { kind: LitKind::Str(sym, ..), span, .. })] => {
+                    (sym, span)
+                }
+                [NestedMetaItem::Literal(Lit { span, .. })
+                | NestedMetaItem::MetaItem(MetaItem { span, .. })] => {
+                    sess.span_diagnostic
+                        .struct_span_err(*span, "expected a version literal")
+                        .emit();
+                    return false;
+                }
+                [..] => {
+                    sess.span_diagnostic
+                        .struct_span_err(cfg.span, "expected single version literal")
+                        .emit();
+                    return false;
+                }
+            };
+            let min_version = match Version::parse(&min_version.as_str()) {
+                Some(ver) => ver,
+                None => {
+                    sess.span_diagnostic.struct_span_err(*span, "invalid version literal").emit();
+                    return false;
+                }
+            };
+            let channel = env!("CFG_RELEASE_CHANNEL");
+            let nightly = channel == "nightly" || channel == "dev";
+            let rustc_version = Version::parse(env!("CFG_RELEASE")).unwrap();
+
+            // See https://github.com/rust-lang/rust/issues/64796#issuecomment-625474439 for details
+            if nightly { rustc_version > min_version } else { rustc_version >= min_version }
+        }
         ast::MetaItemKind::List(ref mis) => {
             for mi in mis.iter() {
                 if !mi.is_meta_item() {
@@ -630,12 +595,12 @@ pub fn eval_condition(
             // The unwraps below may look dangerous, but we've already asserted
             // that they won't fail with the loop above.
             match cfg.name_or_empty() {
-                sym::any => {
-                    mis.iter().any(|mi| eval_condition(mi.meta_item().unwrap(), sess, eval))
-                }
-                sym::all => {
-                    mis.iter().all(|mi| eval_condition(mi.meta_item().unwrap(), sess, eval))
-                }
+                sym::any => mis
+                    .iter()
+                    .any(|mi| eval_condition(mi.meta_item().unwrap(), sess, features, eval)),
+                sym::all => mis
+                    .iter()
+                    .all(|mi| eval_condition(mi.meta_item().unwrap(), sess, features, eval)),
                 sym::not => {
                     if mis.len() != 1 {
                         struct_span_err!(
@@ -648,7 +613,7 @@ pub fn eval_condition(
                         return false;
                     }
 
-                    !eval_condition(mis[0].meta_item().unwrap(), sess, eval)
+                    !eval_condition(mis[0].meta_item().unwrap(), sess, features, eval)
                 }
                 _ => {
                     struct_span_err!(
@@ -667,23 +632,28 @@ pub fn eval_condition(
     }
 }
 
-#[derive(RustcEncodable, RustcDecodable, Clone, HashStable_Generic)]
+#[derive(Encodable, Decodable, Clone, HashStable_Generic)]
 pub struct Deprecation {
     pub since: Option<Symbol>,
+    /// The note to issue a reason.
     pub note: Option<Symbol>,
+    /// A text snippet used to completely replace any use of the deprecated item in an expression.
+    ///
+    /// This is currently unstable.
+    pub suggestion: Option<Symbol>,
+
+    /// Whether to treat the since attribute as being a Rust version identifier
+    /// (rather than an opaque string).
+    pub is_since_rustc_version: bool,
 }
 
 /// Finds the deprecation attribute. `None` if none exists.
-pub fn find_deprecation(
-    sess: &ParseSess,
-    attrs: &[Attribute],
-    item_sp: Span,
-) -> Option<Deprecation> {
+pub fn find_deprecation(sess: &Session, attrs: &[Attribute], item_sp: Span) -> Option<Deprecation> {
     find_deprecation_generic(sess, attrs.iter(), item_sp)
 }
 
 fn find_deprecation_generic<'a, I>(
-    sess: &ParseSess,
+    sess: &Session,
     attrs_iter: I,
     item_sp: Span,
 ) -> Option<Deprecation>
@@ -691,10 +661,11 @@ where
     I: Iterator<Item = &'a Attribute>,
 {
     let mut depr: Option<Deprecation> = None;
-    let diagnostic = &sess.span_diagnostic;
+    let diagnostic = &sess.parse_sess.span_diagnostic;
 
     'outer: for attr in attrs_iter {
-        if !attr.check_name(sym::deprecated) {
+        if !(sess.check_name(attr, sym::deprecated) || sess.check_name(attr, sym::rustc_deprecated))
+        {
             continue;
         }
 
@@ -707,16 +678,17 @@ where
             Some(meta) => meta,
             None => continue,
         };
-        depr = match &meta.kind {
-            MetaItemKind::Word => Some(Deprecation { since: None, note: None }),
-            MetaItemKind::NameValue(..) => {
-                meta.value_str().map(|note| Deprecation { since: None, note: Some(note) })
-            }
+        let mut since = None;
+        let mut note = None;
+        let mut suggestion = None;
+        match &meta.kind {
+            MetaItemKind::Word => {}
+            MetaItemKind::NameValue(..) => note = meta.value_str(),
             MetaItemKind::List(list) => {
                 let get = |meta: &MetaItem, item: &mut Option<Symbol>| {
                     if item.is_some() {
                         handle_errors(
-                            sess,
+                            &sess.parse_sess,
                             meta.span,
                             AttrError::MultipleItem(pprust::path_to_string(&meta.path)),
                         );
@@ -728,7 +700,7 @@ where
                     } else {
                         if let Some(lit) = meta.name_value_literal() {
                             handle_errors(
-                                sess,
+                                &sess.parse_sess,
                                 lit.span,
                                 AttrError::UnsupportedLiteral(
                                     "literal in `deprecated` \
@@ -745,8 +717,6 @@ where
                     }
                 };
 
-                let mut since = None;
-                let mut note = None;
                 for meta in list {
                     match meta {
                         NestedMetaItem::MetaItem(mi) => match mi.name_or_empty() {
@@ -755,18 +725,32 @@ where
                                     continue 'outer;
                                 }
                             }
-                            sym::note => {
+                            sym::note if sess.check_name(attr, sym::deprecated) => {
                                 if !get(mi, &mut note) {
+                                    continue 'outer;
+                                }
+                            }
+                            sym::reason if sess.check_name(attr, sym::rustc_deprecated) => {
+                                if !get(mi, &mut note) {
+                                    continue 'outer;
+                                }
+                            }
+                            sym::suggestion if sess.check_name(attr, sym::rustc_deprecated) => {
+                                if !get(mi, &mut suggestion) {
                                     continue 'outer;
                                 }
                             }
                             _ => {
                                 handle_errors(
-                                    sess,
+                                    &sess.parse_sess,
                                     meta.span(),
                                     AttrError::UnknownMetaItem(
                                         pprust::path_to_string(&mi.path),
-                                        &["since", "note"],
+                                        if sess.check_name(attr, sym::deprecated) {
+                                            &["since", "note"]
+                                        } else {
+                                            &["since", "reason", "suggestion"]
+                                        },
                                     ),
                                 );
                                 continue 'outer;
@@ -774,7 +758,7 @@ where
                         },
                         NestedMetaItem::Literal(lit) => {
                             handle_errors(
-                                sess,
+                                &sess.parse_sess,
                                 lit.span,
                                 AttrError::UnsupportedLiteral(
                                     "item in `deprecated` must be a key/value pair",
@@ -785,16 +769,35 @@ where
                         }
                     }
                 }
-
-                Some(Deprecation { since, note })
             }
-        };
+        }
+
+        if suggestion.is_some() && sess.check_name(attr, sym::deprecated) {
+            unreachable!("only allowed on rustc_deprecated")
+        }
+
+        if sess.check_name(attr, sym::rustc_deprecated) {
+            if since.is_none() {
+                handle_errors(&sess.parse_sess, attr.span, AttrError::MissingSince);
+                continue;
+            }
+
+            if note.is_none() {
+                struct_span_err!(diagnostic, attr.span, E0543, "missing 'reason'").emit();
+                continue;
+            }
+        }
+
+        sess.mark_attr_used(&attr);
+
+        let is_since_rustc_version = sess.check_name(attr, sym::rustc_deprecated);
+        depr = Some(Deprecation { since, note, suggestion, is_since_rustc_version });
     }
 
     depr
 }
 
-#[derive(PartialEq, Debug, RustcEncodable, RustcDecodable, Copy, Clone)]
+#[derive(PartialEq, Debug, Encodable, Decodable, Copy, Clone)]
 pub enum ReprAttr {
     ReprInt(IntType),
     ReprC,
@@ -805,7 +808,8 @@ pub enum ReprAttr {
     ReprNoNiche,
 }
 
-#[derive(Eq, PartialEq, Debug, RustcEncodable, RustcDecodable, Copy, Clone, HashStable_Generic)]
+#[derive(Eq, PartialEq, Debug, Copy, Clone)]
+#[derive(Encodable, Decodable, HashStable_Generic)]
 pub enum IntType {
     SignedInt(ast::IntTy),
     UnsignedInt(ast::UintTy),
@@ -830,18 +834,18 @@ impl IntType {
 /// the same discriminant size that the corresponding C enum would or C
 /// structure layout, `packed` to remove padding, and `transparent` to elegate representation
 /// concerns to the only non-ZST field.
-pub fn find_repr_attrs(sess: &ParseSess, attr: &Attribute) -> Vec<ReprAttr> {
+pub fn find_repr_attrs(sess: &Session, attr: &Attribute) -> Vec<ReprAttr> {
     use ReprAttr::*;
 
     let mut acc = Vec::new();
-    let diagnostic = &sess.span_diagnostic;
+    let diagnostic = &sess.parse_sess.span_diagnostic;
     if attr.has_name(sym::repr) {
         if let Some(items) = attr.meta_item_list() {
-            mark_used(attr);
+            sess.mark_attr_used(attr);
             for item in items {
                 if !item.is_meta_item() {
                     handle_errors(
-                        sess,
+                        &sess.parse_sess,
                         item.span(),
                         AttrError::UnsupportedLiteral(
                             "meta item in `repr` must be an identifier",
@@ -910,7 +914,7 @@ pub fn find_repr_attrs(sess: &ParseSess, attr: &Attribute) -> Vec<ReprAttr> {
                     }
                 } else {
                     if let Some(meta_item) = item.meta_item() {
-                        if meta_item.check_name(sym::align) {
+                        if meta_item.has_name(sym::align) {
                             if let MetaItemKind::NameValue(ref value) = meta_item.kind {
                                 recognised = true;
                                 let mut err = struct_span_err!(
@@ -985,22 +989,23 @@ pub enum TransparencyError {
 }
 
 pub fn find_transparency(
+    sess: &Session,
     attrs: &[Attribute],
     macro_rules: bool,
 ) -> (Transparency, Option<TransparencyError>) {
     let mut transparency = None;
     let mut error = None;
     for attr in attrs {
-        if attr.check_name(sym::rustc_macro_transparency) {
+        if sess.check_name(attr, sym::rustc_macro_transparency) {
             if let Some((_, old_span)) = transparency {
                 error = Some(TransparencyError::MultipleTransparencyAttrs(old_span, attr.span));
                 break;
             } else if let Some(value) = attr.value_str() {
                 transparency = Some((
-                    match &*value.as_str() {
-                        "transparent" => Transparency::Transparent,
-                        "semitransparent" => Transparency::SemiTransparent,
-                        "opaque" => Transparency::Opaque,
+                    match value {
+                        sym::transparent => Transparency::Transparent,
+                        sym::semitransparent => Transparency::SemiTransparent,
+                        sym::opaque => Transparency::Opaque,
                         _ => {
                             error = Some(TransparencyError::UnknownTransparency(value, attr.span));
                             continue;
@@ -1016,18 +1021,20 @@ pub fn find_transparency(
 }
 
 pub fn allow_internal_unstable<'a>(
+    sess: &'a Session,
     attrs: &[Attribute],
-    diag: &'a rustc_errors::Handler,
 ) -> Option<impl Iterator<Item = Symbol> + 'a> {
-    let attr = find_by_name(attrs, sym::allow_internal_unstable)?;
+    let attr = sess.find_by_name(attrs, sym::allow_internal_unstable)?;
     let list = attr.meta_item_list().or_else(|| {
-        diag.span_err(attr.span, "allow_internal_unstable expects list of feature names");
+        sess.diagnostic()
+            .span_err(attr.span, "allow_internal_unstable expects list of feature names");
         None
     })?;
     Some(list.into_iter().filter_map(move |it| {
         let name = it.ident().map(|ident| ident.name);
         if name.is_none() {
-            diag.span_err(it.span(), "`allow_internal_unstable` expects feature names");
+            sess.diagnostic()
+                .span_err(it.span(), "`allow_internal_unstable` expects feature names");
         }
         name
     }))

@@ -3,7 +3,7 @@ use crate::stable_hasher::{HashStable, StableHasher};
 /// A vector type optimized for cases where this size is usually 0 (cf. `SmallVector`).
 /// The `Option<Box<..>>` wrapping allows us to represent a zero sized vector with `None`,
 /// which uses only a single (null) pointer.
-#[derive(Clone, RustcEncodable, RustcDecodable, Debug)]
+#[derive(Clone, Encodable, Decodable, Debug)]
 pub struct ThinVec<T>(Option<Box<Vec<T>>>);
 
 impl<T> ThinVec<T> {
@@ -51,6 +51,20 @@ impl<T> Extend<T> for ThinVec<T> {
         match *self {
             ThinVec(Some(ref mut vec)) => vec.extend(iter),
             ThinVec(None) => *self = iter.into_iter().collect::<Vec<_>>().into(),
+        }
+    }
+
+    fn extend_one(&mut self, item: T) {
+        match *self {
+            ThinVec(Some(ref mut vec)) => vec.push(item),
+            ThinVec(None) => *self = vec![item].into(),
+        }
+    }
+
+    fn extend_reserve(&mut self, additional: usize) {
+        match *self {
+            ThinVec(Some(ref mut vec)) => vec.reserve(additional),
+            ThinVec(None) => *self = Vec::with_capacity(additional).into(),
         }
     }
 }

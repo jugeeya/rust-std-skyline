@@ -8,7 +8,7 @@ use rustc_macros::HashStable;
 /// kind of crate, including cdylibs which export very few things.
 /// `Rust` will only be exported if the crate produced is a Rust
 /// dylib.
-#[derive(Eq, PartialEq, Debug, Copy, Clone, RustcEncodable, RustcDecodable, HashStable)]
+#[derive(Eq, PartialEq, Debug, Copy, Clone, TyEncodable, TyDecodable, HashStable)]
 pub enum SymbolExportLevel {
     C,
     Rust,
@@ -21,18 +21,18 @@ impl SymbolExportLevel {
     }
 }
 
-#[derive(Eq, PartialEq, Debug, Copy, Clone, RustcEncodable, RustcDecodable, HashStable)]
+#[derive(Eq, PartialEq, Debug, Copy, Clone, TyEncodable, TyDecodable, HashStable)]
 pub enum ExportedSymbol<'tcx> {
     NonGeneric(DefId),
     Generic(DefId, SubstsRef<'tcx>),
     DropGlue(Ty<'tcx>),
-    NoDefId(ty::SymbolName),
+    NoDefId(ty::SymbolName<'tcx>),
 }
 
 impl<'tcx> ExportedSymbol<'tcx> {
     /// This is the symbol name of an instance if it is instantiated in the
     /// local crate.
-    pub fn symbol_name_for_local_instance(&self, tcx: TyCtxt<'tcx>) -> ty::SymbolName {
+    pub fn symbol_name_for_local_instance(&self, tcx: TyCtxt<'tcx>) -> ty::SymbolName<'tcx> {
         match *self {
             ExportedSymbol::NonGeneric(def_id) => tcx.symbol_name(ty::Instance::mono(tcx, def_id)),
             ExportedSymbol::Generic(def_id, substs) => {

@@ -1,6 +1,8 @@
 #![allow(non_camel_case_types)]
 #![allow(non_upper_case_globals)]
 
+use rustc_codegen_ssa::coverageinfo::map as coverage_map;
+
 use super::debuginfo::{
     DIArray, DIBasicType, DIBuilder, DICompositeType, DIDerivedType, DIDescriptor, DIEnumerator,
     DIFile, DIFlags, DIGlobalVariableExpression, DILexicalBlock, DINameSpace, DISPFlags, DIScope,
@@ -45,6 +47,8 @@ pub enum CallConv {
     X86_64_Win64 = 79,
     X86_VectorCall = 80,
     X86_Intr = 83,
+    AvrNonBlockingInterrupt = 84,
+    AvrInterrupt = 85,
     AmdGpuKernel = 91,
 }
 
@@ -124,6 +128,8 @@ pub enum Attribute {
     NonLazyBind = 23,
     OptimizeNone = 24,
     ReturnsTwice = 25,
+    ReadNone = 26,
+    InaccessibleMemOnly = 27,
 }
 
 /// LLVMIntPredicate
@@ -229,6 +235,8 @@ pub enum TypeKind {
     Metadata = 14,
     X86_MMX = 15,
     Token = 16,
+    ScalableVector = 17,
+    BFloat = 18,
 }
 
 impl TypeKind {
@@ -251,6 +259,8 @@ impl TypeKind {
             TypeKind::Metadata => rustc_codegen_ssa::common::TypeKind::Metadata,
             TypeKind::X86_MMX => rustc_codegen_ssa::common::TypeKind::X86_MMX,
             TypeKind::Token => rustc_codegen_ssa::common::TypeKind::Token,
+            TypeKind::ScalableVector => rustc_codegen_ssa::common::TypeKind::ScalableVector,
+            TypeKind::BFloat => rustc_codegen_ssa::common::TypeKind::BFloat,
         }
     }
 }
@@ -327,9 +337,6 @@ impl AtomicOrdering {
 #[derive(Copy, Clone)]
 #[repr(C)]
 pub enum SynchronizationScope {
-    // FIXME: figure out if this variant is needed at all.
-    #[allow(dead_code)]
-    Other,
     SingleThread,
     CrossThread,
 }
@@ -337,7 +344,6 @@ pub enum SynchronizationScope {
 impl SynchronizationScope {
     pub fn from_generic(sc: rustc_codegen_ssa::common::SynchronizationScope) -> Self {
         match sc {
-            rustc_codegen_ssa::common::SynchronizationScope::Other => SynchronizationScope::Other,
             rustc_codegen_ssa::common::SynchronizationScope::SingleThread => {
                 SynchronizationScope::SingleThread
             }
@@ -352,9 +358,6 @@ impl SynchronizationScope {
 #[derive(Copy, Clone)]
 #[repr(C)]
 pub enum FileType {
-    // FIXME: figure out if this variant is needed at all.
-    #[allow(dead_code)]
-    Other,
     AssemblyFile,
     ObjectFile,
 }
@@ -381,18 +384,15 @@ pub enum MetadataType {
 #[derive(Copy, Clone)]
 #[repr(C)]
 pub enum AsmDialect {
-    // FIXME: figure out if this variant is needed at all.
-    #[allow(dead_code)]
-    Other,
     Att,
     Intel,
 }
 
 impl AsmDialect {
-    pub fn from_generic(asm: rustc_ast::ast::LlvmAsmDialect) -> Self {
+    pub fn from_generic(asm: rustc_ast::LlvmAsmDialect) -> Self {
         match asm {
-            rustc_ast::ast::LlvmAsmDialect::Att => AsmDialect::Att,
-            rustc_ast::ast::LlvmAsmDialect::Intel => AsmDialect::Intel,
+            rustc_ast::LlvmAsmDialect::Att => AsmDialect::Att,
+            rustc_ast::LlvmAsmDialect::Intel => AsmDialect::Intel,
         }
     }
 }
@@ -401,9 +401,6 @@ impl AsmDialect {
 #[derive(Copy, Clone, PartialEq)]
 #[repr(C)]
 pub enum CodeGenOptLevel {
-    // FIXME: figure out if this variant is needed at all.
-    #[allow(dead_code)]
-    Other,
     None,
     Less,
     Default,
@@ -435,18 +432,18 @@ pub enum OptStage {
 /// LLVMRustSanitizerOptions
 #[repr(C)]
 pub struct SanitizerOptions {
-    pub sanitize_memory: bool,
-    pub sanitize_thread: bool,
     pub sanitize_address: bool,
-    pub sanitize_recover: bool,
+    pub sanitize_address_recover: bool,
+    pub sanitize_memory: bool,
+    pub sanitize_memory_recover: bool,
     pub sanitize_memory_track_origins: c_int,
+    pub sanitize_thread: bool,
 }
 
 /// LLVMRelocMode
 #[derive(Copy, Clone, PartialEq)]
 #[repr(C)]
-pub enum RelocMode {
-    Default,
+pub enum RelocModel {
     Static,
     PIC,
     DynamicNoPic,
@@ -459,9 +456,7 @@ pub enum RelocMode {
 #[derive(Copy, Clone)]
 #[repr(C)]
 pub enum CodeModel {
-    // FIXME: figure out if this variant is needed at all.
-    #[allow(dead_code)]
-    Other,
+    Tiny,
     Small,
     Kernel,
     Medium,
@@ -490,13 +485,21 @@ pub enum DiagnosticKind {
     Linker,
 }
 
+/// LLVMRustDiagnosticLevel
+#[derive(Copy, Clone)]
+#[repr(C)]
+#[allow(dead_code)] // Variants constructed by C++.
+pub enum DiagnosticLevel {
+    Error,
+    Warning,
+    Note,
+    Remark,
+}
+
 /// LLVMRustArchiveKind
 #[derive(Copy, Clone)]
 #[repr(C)]
 pub enum ArchiveKind {
-    // FIXME: figure out if this variant is needed at all.
-    #[allow(dead_code)]
-    Other,
     K_GNU,
     K_BSD,
     K_DARWIN,
@@ -632,6 +635,155 @@ pub struct Linker<'a>(InvariantOpaque<'a>);
 
 pub type DiagnosticHandler = unsafe extern "C" fn(&DiagnosticInfo, *mut c_void);
 pub type InlineAsmDiagHandler = unsafe extern "C" fn(&SMDiagnostic, *const c_void, c_uint);
+
+pub mod coverageinfo {
+    use super::coverage_map;
+
+    /// Aligns with [llvm::coverage::CounterMappingRegion::RegionKind](https://github.com/rust-lang/llvm-project/blob/rustc/10.0-2020-05-05/llvm/include/llvm/ProfileData/Coverage/CoverageMapping.h#L205-L221)
+    #[derive(Copy, Clone, Debug)]
+    #[repr(C)]
+    pub enum RegionKind {
+        /// A CodeRegion associates some code with a counter
+        CodeRegion = 0,
+
+        /// An ExpansionRegion represents a file expansion region that associates
+        /// a source range with the expansion of a virtual source file, such as
+        /// for a macro instantiation or #include file.
+        ExpansionRegion = 1,
+
+        /// A SkippedRegion represents a source range with code that was skipped
+        /// by a preprocessor or similar means.
+        SkippedRegion = 2,
+
+        /// A GapRegion is like a CodeRegion, but its count is only set as the
+        /// line execution count when its the only region in the line.
+        GapRegion = 3,
+    }
+
+    /// This struct provides LLVM's representation of a "CoverageMappingRegion", encoded into the
+    /// coverage map, in accordance with the
+    /// [LLVM Code Coverage Mapping Format](https://github.com/rust-lang/llvm-project/blob/llvmorg-8.0.0/llvm/docs/CoverageMappingFormat.rst#llvm-code-coverage-mapping-format).
+    /// The struct composes fields representing the `Counter` type and value(s) (injected counter
+    /// ID, or expression type and operands), the source file (an indirect index into a "filenames
+    /// array", encoded separately), and source location (start and end positions of the represented
+    /// code region).
+    ///
+    /// Aligns with [llvm::coverage::CounterMappingRegion](https://github.com/rust-lang/llvm-project/blob/rustc/10.0-2020-05-05/llvm/include/llvm/ProfileData/Coverage/CoverageMapping.h#L223-L226)
+    /// Important: The Rust struct layout (order and types of fields) must match its C++
+    /// counterpart.
+    #[derive(Copy, Clone, Debug)]
+    #[repr(C)]
+    pub struct CounterMappingRegion {
+        /// The counter type and type-dependent counter data, if any.
+        counter: coverage_map::Counter,
+
+        /// An indirect reference to the source filename. In the LLVM Coverage Mapping Format, the
+        /// file_id is an index into a function-specific `virtual_file_mapping` array of indexes
+        /// that, in turn, are used to look up the filename for this region.
+        file_id: u32,
+
+        /// If the `RegionKind` is an `ExpansionRegion`, the `expanded_file_id` can be used to find
+        /// the mapping regions created as a result of macro expansion, by checking if their file id
+        /// matches the expanded file id.
+        expanded_file_id: u32,
+
+        /// 1-based starting line of the mapping region.
+        start_line: u32,
+
+        /// 1-based starting column of the mapping region.
+        start_col: u32,
+
+        /// 1-based ending line of the mapping region.
+        end_line: u32,
+
+        /// 1-based ending column of the mapping region. If the high bit is set, the current
+        /// mapping region is a gap area.
+        end_col: u32,
+
+        kind: RegionKind,
+    }
+
+    impl CounterMappingRegion {
+        pub fn code_region(
+            counter: coverage_map::Counter,
+            file_id: u32,
+            start_line: u32,
+            start_col: u32,
+            end_line: u32,
+            end_col: u32,
+        ) -> Self {
+            Self {
+                counter,
+                file_id,
+                expanded_file_id: 0,
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+                kind: RegionKind::CodeRegion,
+            }
+        }
+
+        pub fn expansion_region(
+            file_id: u32,
+            expanded_file_id: u32,
+            start_line: u32,
+            start_col: u32,
+            end_line: u32,
+            end_col: u32,
+        ) -> Self {
+            Self {
+                counter: coverage_map::Counter::zero(),
+                file_id,
+                expanded_file_id,
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+                kind: RegionKind::ExpansionRegion,
+            }
+        }
+
+        pub fn skipped_region(
+            file_id: u32,
+            start_line: u32,
+            start_col: u32,
+            end_line: u32,
+            end_col: u32,
+        ) -> Self {
+            Self {
+                counter: coverage_map::Counter::zero(),
+                file_id,
+                expanded_file_id: 0,
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+                kind: RegionKind::SkippedRegion,
+            }
+        }
+
+        pub fn gap_region(
+            counter: coverage_map::Counter,
+            file_id: u32,
+            start_line: u32,
+            start_col: u32,
+            end_line: u32,
+            end_col: u32,
+        ) -> Self {
+            Self {
+                counter,
+                file_id,
+                expanded_file_id: 0,
+                start_line,
+                start_col,
+                end_line,
+                end_col: ((1 as u32) << 31) | end_col,
+                kind: RegionKind::GapRegion,
+            }
+        }
+    }
+}
 
 pub mod debuginfo {
     use super::{InvariantOpaque, Metadata};
@@ -1348,6 +1500,7 @@ extern "C" {
 
     // Miscellaneous instructions
     pub fn LLVMBuildPhi(B: &Builder<'a>, Ty: &'a Type, Name: *const c_char) -> &'a Value;
+    pub fn LLVMRustGetInstrProfIncrementIntrinsic(M: &Module) -> &'a Value;
     pub fn LLVMRustBuildCall(
         B: &Builder<'a>,
         Fn: &'a Value,
@@ -1615,6 +1768,35 @@ extern "C" {
         ConstraintsLen: size_t,
     ) -> bool;
 
+    #[allow(improper_ctypes)]
+    pub fn LLVMRustCoverageWriteFilenamesSectionToBuffer(
+        Filenames: *const *const c_char,
+        FilenamesLen: size_t,
+        BufferOut: &RustString,
+    );
+
+    #[allow(improper_ctypes)]
+    pub fn LLVMRustCoverageWriteMappingToBuffer(
+        VirtualFileMappingIDs: *const c_uint,
+        NumVirtualFileMappingIDs: c_uint,
+        Expressions: *const coverage_map::CounterExpression,
+        NumExpressions: c_uint,
+        MappingRegions: *mut coverageinfo::CounterMappingRegion,
+        NumMappingRegions: c_uint,
+        BufferOut: &RustString,
+    );
+
+    pub fn LLVMRustCoverageCreatePGOFuncNameVar(F: &'a Value, FuncName: *const c_char)
+    -> &'a Value;
+    pub fn LLVMRustCoverageComputeHash(Name: *const c_char) -> u64;
+
+    #[allow(improper_ctypes)]
+    pub fn LLVMRustCoverageWriteSectionNameToString(M: &Module, Str: &RustString);
+
+    #[allow(improper_ctypes)]
+    pub fn LLVMRustCoverageWriteMappingVarNameToString(Str: &RustString);
+
+    pub fn LLVMRustCoverageMappingVersion() -> u32;
     pub fn LLVMRustDebugMetadataVersion() -> u32;
     pub fn LLVMRustVersionMajor() -> u32;
     pub fn LLVMRustVersionMinor() -> u32;
@@ -1656,7 +1838,6 @@ extern "C" {
 
     pub fn LLVMRustDIBuilderCreateSubroutineType(
         Builder: &DIBuilder<'a>,
-        File: &'a DIFile,
         ParameterTypes: &'a DIArray,
     ) -> &'a DICompositeType;
 
@@ -1683,9 +1864,18 @@ extern "C" {
         Name: *const c_char,
         NameLen: size_t,
         SizeInBits: u64,
-        AlignInBits: u32,
         Encoding: c_uint,
     ) -> &'a DIBasicType;
+
+    pub fn LLVMRustDIBuilderCreateTypedef(
+        Builder: &DIBuilder<'a>,
+        Type: &'a DIBasicType,
+        Name: *const c_char,
+        NameLen: size_t,
+        File: &'a DIFile,
+        LineNo: c_uint,
+        Scope: Option<&'a DIScope>,
+    ) -> &'a DIDerivedType;
 
     pub fn LLVMRustDIBuilderCreatePointerType(
         Builder: &DIBuilder<'a>,
@@ -1881,9 +2071,6 @@ extern "C" {
         Name: *const c_char,
         NameLen: size_t,
         Ty: &'a DIType,
-        File: &'a DIFile,
-        LineNo: c_uint,
-        ColumnNo: c_uint,
     ) -> &'a DITemplateTypeParameter;
 
     pub fn LLVMRustDIBuilderCreateNameSpace(
@@ -1946,10 +2133,9 @@ extern "C" {
         Features: *const c_char,
         Abi: *const c_char,
         Model: CodeModel,
-        Reloc: RelocMode,
+        Reloc: RelocModel,
         Level: CodeGenOptLevel,
         UseSoftFP: bool,
-        PositionIndependentExecutable: bool,
         FunctionSections: bool,
         DataSections: bool,
         TrapUnreachable: bool,
@@ -1957,6 +2143,7 @@ extern "C" {
         AsmComments: bool,
         EmitStackSizeSection: bool,
         RelaxELFRelocations: bool,
+        UseInitArray: bool,
     ) -> Option<&'static mut TargetMachine>;
     pub fn LLVMRustDisposeTargetMachine(T: &'static mut TargetMachine);
     pub fn LLVMRustAddBuilderLibraryInfo(
@@ -2000,6 +2187,7 @@ extern "C" {
         SLPVectorize: bool,
         LoopVectorize: bool,
         DisableSimplifyLibCalls: bool,
+        EmitLifetimeMarkers: bool,
         SanitizerOptions: Option<&SanitizerOptions>,
         PGOGenPath: *const c_char,
         PGOUsePath: *const c_char,
@@ -2059,6 +2247,7 @@ extern "C" {
 
     pub fn LLVMRustUnpackInlineAsmDiagnostic(
         DI: &'a DiagnosticInfo,
+        level_out: &mut DiagnosticLevel,
         cookie_out: &mut c_uint,
         message_out: &mut Option<&'a Twine>,
         instruction_out: &mut Option<&'a Value>,
@@ -2075,7 +2264,15 @@ extern "C" {
     );
 
     #[allow(improper_ctypes)]
-    pub fn LLVMRustWriteSMDiagnosticToString(d: &SMDiagnostic, s: &RustString);
+    pub fn LLVMRustUnpackSMDiagnostic(
+        d: &SMDiagnostic,
+        message_out: &RustString,
+        buffer_out: &RustString,
+        level_out: &mut DiagnosticLevel,
+        loc_out: &mut c_uint,
+        ranges_out: *mut c_uint,
+        num_ranges: &mut usize,
+    ) -> bool;
 
     pub fn LLVMRustWriteArchive(
         Dst: *const c_char,
@@ -2122,10 +2319,18 @@ extern "C" {
         PreservedSymbols: *const *const c_char,
         PreservedSymbolsLen: c_uint,
     ) -> Option<&'static mut ThinLTOData>;
-    pub fn LLVMRustPrepareThinLTORename(Data: &ThinLTOData, Module: &Module) -> bool;
+    pub fn LLVMRustPrepareThinLTORename(
+        Data: &ThinLTOData,
+        Module: &Module,
+        Target: &TargetMachine,
+    ) -> bool;
     pub fn LLVMRustPrepareThinLTOResolveWeak(Data: &ThinLTOData, Module: &Module) -> bool;
     pub fn LLVMRustPrepareThinLTOInternalize(Data: &ThinLTOData, Module: &Module) -> bool;
-    pub fn LLVMRustPrepareThinLTOImport(Data: &ThinLTOData, Module: &Module) -> bool;
+    pub fn LLVMRustPrepareThinLTOImport(
+        Data: &ThinLTOData,
+        Module: &Module,
+        Target: &TargetMachine,
+    ) -> bool;
     pub fn LLVMRustGetThinLTOModuleImports(
         Data: *const ThinLTOData,
         ModuleNameCallback: ThinLTOModuleNameCallback,
@@ -2138,6 +2343,11 @@ extern "C" {
         len: usize,
         Identifier: *const c_char,
     ) -> Option<&Module>;
+    pub fn LLVMRustGetBitcodeSliceFromObjectData(
+        Data: *const u8,
+        len: usize,
+        out_len: &mut usize,
+    ) -> *const u8;
     pub fn LLVMRustThinLTOGetDICompileUnit(
         M: &Module,
         CU1: &mut *mut c_void,

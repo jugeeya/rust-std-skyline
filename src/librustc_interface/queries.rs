@@ -1,9 +1,9 @@
 use crate::interface::{Compiler, Result};
 use crate::passes::{self, BoxedResolver, QueryContext};
 
-use rustc_ast::{self, ast};
+use rustc_ast as ast;
 use rustc_codegen_ssa::traits::CodegenBackend;
-use rustc_data_structures::sync::{Lrc, Once, WorkerLocal};
+use rustc_data_structures::sync::{Lrc, OnceCell, WorkerLocal};
 use rustc_errors::ErrorReported;
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_hir::Crate;
@@ -18,7 +18,6 @@ use rustc_session::{output::find_crate_name, Session};
 use rustc_span::symbol::sym;
 use std::any::Any;
 use std::cell::{Ref, RefCell, RefMut};
-use std::mem;
 use std::rc::Rc;
 
 /// Represent the result of a query.
@@ -65,7 +64,7 @@ impl<T> Default for Query<T> {
 
 pub struct Queries<'tcx> {
     compiler: &'tcx Compiler,
-    gcx: Once<GlobalCtxt<'tcx>>,
+    gcx: OnceCell<GlobalCtxt<'tcx>>,
 
     arena: WorkerLocal<Arena<'tcx>>,
     hir_arena: WorkerLocal<rustc_ast_lowering::Arena<'tcx>>,
@@ -86,7 +85,7 @@ impl<'tcx> Queries<'tcx> {
     pub fn new(compiler: &'tcx Compiler) -> Queries<'tcx> {
         Queries {
             compiler,
-            gcx: Once::new(),
+            gcx: OnceCell::new(),
             arena: WorkerLocal::new(|_| Arena::default()),
             hir_arena: WorkerLocal::new(|_| rustc_ast_lowering::Arena::default()),
             dep_graph_future: Default::default(),
@@ -137,7 +136,7 @@ impl<'tcx> Queries<'tcx> {
             let result = passes::register_plugins(
                 self.session(),
                 &*self.codegen_backend().metadata_loader(),
-                self.compiler.register_lints.as_ref().map(|p| &**p).unwrap_or_else(|| empty),
+                self.compiler.register_lints.as_deref().unwrap_or_else(|| empty),
                 krate,
                 &crate_name,
             );
@@ -160,7 +159,7 @@ impl<'tcx> Queries<'tcx> {
                 None => {
                     let parse_result = self.parse()?;
                     let krate = parse_result.peek();
-                    find_crate_name(Some(self.session()), &krate.attrs, &self.compiler.input)
+                    find_crate_name(self.session(), &krate.attrs, &self.compiler.input)
                 }
             })
         })
@@ -169,6 +168,7 @@ impl<'tcx> Queries<'tcx> {
     pub fn expansion(
         &self,
     ) -> Result<&Query<(ast::Crate, Steal<Rc<RefCell<BoxedResolver>>>, Lrc<LintStore>)>> {
+        tracing::trace!("expansion");
         self.expansion.compute(|| {
             let crate_name = self.crate_name()?.peek().clone();
             let (krate, lint_store) = self.register_plugins()?.take();
@@ -293,8 +293,8 @@ impl<'tcx> Queries<'tcx> {
             _ => return,
         };
 
-        let attrs = &*tcx.get_attrs(def_id);
-        let attrs = attrs.iter().filter(|attr| attr.check_name(sym::rustc_error));
+        let attrs = &*tcx.get_attrs(def_id.to_def_id());
+        let attrs = attrs.iter().filter(|attr| tcx.sess.check_name(attr, sym::rustc_error));
         for attr in attrs {
             match attr.meta_item_list() {
                 // Check if there is a `#[rustc_error(delay_span_bug_from_inside_query)]`.
@@ -393,38 +393,5 @@ impl Compiler {
         _timer = Some(self.session().timer("free_global_ctxt"));
 
         ret
-    }
-
-    // This method is different to all the other methods in `Compiler` because
-    // it lacks a `Queries` entry. It's also not currently used. It does serve
-    // as an example of how `Compiler` can be used, with additional steps added
-    // between some passes. And see `rustc_driver::run_compiler` for a more
-    // complex example.
-    pub fn compile(&self) -> Result<()> {
-        let linker = self.enter(|queries| {
-            queries.prepare_outputs()?;
-
-            if self.session().opts.output_types.contains_key(&OutputType::DepInfo)
-                && self.session().opts.output_types.len() == 1
-            {
-                return Ok(None);
-            }
-
-            queries.global_ctxt()?;
-
-            // Drop AST after creating GlobalCtxt to free memory.
-            mem::drop(queries.expansion()?.take());
-
-            queries.ongoing_codegen()?;
-
-            let linker = queries.linker()?;
-            Ok(Some(linker))
-        })?;
-
-        if let Some(linker) = linker {
-            linker.link()?
-        }
-
-        Ok(())
     }
 }

@@ -11,17 +11,22 @@ use super::PredicateObligation;
 use super::Selection;
 use super::SelectionContext;
 use super::SelectionError;
+use super::{
+    ImplSourceClosureData, ImplSourceDiscriminantKindData, ImplSourceFnPointerData,
+    ImplSourceGeneratorData, ImplSourceUserDefinedData,
+};
 use super::{Normalized, NormalizedTy, ProjectionCacheEntry, ProjectionCacheKey};
-use super::{VtableClosureData, VtableFnPointerData, VtableGeneratorData, VtableImplData};
 
 use crate::infer::type_variable::{TypeVariableOrigin, TypeVariableOriginKind};
 use crate::infer::{InferCtxt, InferOk, LateBoundRegionConversionTime};
 use crate::traits::error_reporting::InferCtxtExt;
-use rustc_ast::ast::Ident;
+use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_errors::ErrorReported;
 use rustc_hir::def_id::DefId;
+use rustc_hir::lang_items::LangItem;
+use rustc_infer::infer::resolve::OpportunisticRegionResolver;
 use rustc_middle::ty::fold::{TypeFoldable, TypeFolder};
-use rustc_middle::ty::subst::{InternalSubsts, Subst};
+use rustc_middle::ty::subst::Subst;
 use rustc_middle::ty::{self, ToPolyTraitRef, ToPredicate, Ty, TyCtxt, WithConstness};
 use rustc_span::symbol::sym;
 use rustc_span::DUMMY_SP;
@@ -33,6 +38,8 @@ pub type PolyProjectionObligation<'tcx> = Obligation<'tcx, ty::PolyProjectionPre
 pub type ProjectionObligation<'tcx> = Obligation<'tcx, ty::ProjectionPredicate<'tcx>>;
 
 pub type ProjectionTyObligation<'tcx> = Obligation<'tcx, ty::ProjectionTy<'tcx>>;
+
+pub(super) struct InProgress;
 
 /// When attempting to resolve `<T as TraitRef>::Name` ...
 #[derive(Debug)]
@@ -136,22 +143,35 @@ impl<'tcx> ProjectionTyCandidateSet<'tcx> {
 ///
 /// If successful, this may result in additional obligations. Also returns
 /// the projection cache key used to track these additional obligations.
-pub fn poly_project_and_unify_type<'cx, 'tcx>(
+///
+/// ## Returns
+///
+/// - `Err(_)`: the projection can be normalized, but is not equal to the
+///   expected type.
+/// - `Ok(Err(InProgress))`: this is called recursively while normalizing
+///   the same projection.
+/// - `Ok(Ok(None))`: The projection cannot be normalized due to ambiguity
+///   (resolving some inference variables in the projection may fix this).
+/// - `Ok(Ok(Some(obligations)))`: The projection bound holds subject to
+///    the given obligations. If the projection cannot be normalized because
+///    the required trait bound doesn't hold this returned with `obligations`
+///    being a predicate that cannot be proven.
+pub(super) fn poly_project_and_unify_type<'cx, 'tcx>(
     selcx: &mut SelectionContext<'cx, 'tcx>,
     obligation: &PolyProjectionObligation<'tcx>,
-) -> Result<Option<Vec<PredicateObligation<'tcx>>>, MismatchedProjectionTypes<'tcx>> {
+) -> Result<
+    Result<Option<Vec<PredicateObligation<'tcx>>>, InProgress>,
+    MismatchedProjectionTypes<'tcx>,
+> {
     debug!("poly_project_and_unify_type(obligation={:?})", obligation);
 
     let infcx = selcx.infcx();
-    infcx.commit_if_ok(|snapshot| {
-        let (placeholder_predicate, placeholder_map) =
+    infcx.commit_if_ok(|_snapshot| {
+        let (placeholder_predicate, _) =
             infcx.replace_bound_vars_with_placeholders(&obligation.predicate);
 
         let placeholder_obligation = obligation.with(placeholder_predicate);
         let result = project_and_unify_type(selcx, &placeholder_obligation)?;
-        infcx
-            .leak_check(false, &placeholder_map, snapshot)
-            .map_err(|err| MismatchedProjectionTypes { err })?;
         Ok(result)
     })
 }
@@ -161,10 +181,15 @@ pub fn poly_project_and_unify_type<'cx, 'tcx>(
 ///     <T as Trait>::U == V
 ///
 /// If successful, this may result in additional obligations.
+///
+/// See [poly_project_and_unify_type] for an explanation of the return value.
 fn project_and_unify_type<'cx, 'tcx>(
     selcx: &mut SelectionContext<'cx, 'tcx>,
     obligation: &ProjectionObligation<'tcx>,
-) -> Result<Option<Vec<PredicateObligation<'tcx>>>, MismatchedProjectionTypes<'tcx>> {
+) -> Result<
+    Result<Option<Vec<PredicateObligation<'tcx>>>, InProgress>,
+    MismatchedProjectionTypes<'tcx>,
+> {
     debug!("project_and_unify_type(obligation={:?})", obligation);
 
     let mut obligations = vec![];
@@ -176,8 +201,9 @@ fn project_and_unify_type<'cx, 'tcx>(
         obligation.recursion_depth,
         &mut obligations,
     ) {
-        Some(n) => n,
-        None => return Ok(None),
+        Ok(Some(n)) => n,
+        Ok(None) => return Ok(Ok(None)),
+        Err(InProgress) => return Ok(Err(InProgress)),
     };
 
     debug!(
@@ -192,7 +218,7 @@ fn project_and_unify_type<'cx, 'tcx>(
     {
         Ok(InferOk { obligations: inferred_obligations, value: () }) => {
             obligations.extend(inferred_obligations);
-            Ok(Some(obligations))
+            Ok(Ok(Some(obligations)))
         }
         Err(err) => {
             debug!("project_and_unify_type: equating types encountered error {:?}", err);
@@ -261,7 +287,7 @@ where
 {
     debug!("normalize_with_depth(depth={}, value={:?})", depth, value);
     let mut normalizer = AssocTypeNormalizer::new(selcx, param_env, cause, depth, obligations);
-    let result = normalizer.fold(value);
+    let result = ensure_sufficient_stack(|| normalizer.fold(value));
     debug!(
         "normalize_with_depth: depth={} result={:?} with {} obligations",
         depth,
@@ -320,18 +346,17 @@ impl<'a, 'b, 'tcx> TypeFolder<'tcx> for AssocTypeNormalizer<'a, 'b, 'tcx> {
 
         let ty = ty.super_fold_with(self);
         match ty.kind {
-            ty::Opaque(def_id, substs) if !substs.has_escaping_bound_vars() => {
-                // (*)
+            ty::Opaque(def_id, substs) => {
                 // Only normalize `impl Trait` after type-checking, usually in codegen.
-                match self.param_env.reveal {
+                match self.param_env.reveal() {
                     Reveal::UserFacing => ty,
 
                     Reveal::All => {
-                        let recursion_limit = *self.tcx().sess.recursion_limit.get();
-                        if self.depth >= recursion_limit {
+                        let recursion_limit = self.tcx().sess.recursion_limit();
+                        if !recursion_limit.value_within_limit(self.depth) {
                             let obligation = Obligation::with_depth(
                                 self.cause.clone(),
-                                recursion_limit,
+                                recursion_limit.0,
                                 self.param_env,
                                 ty,
                             );
@@ -349,13 +374,11 @@ impl<'a, 'b, 'tcx> TypeFolder<'tcx> for AssocTypeNormalizer<'a, 'b, 'tcx> {
             }
 
             ty::Projection(ref data) if !data.has_escaping_bound_vars() => {
-                // (*)
-
-                // (*) This is kind of hacky -- we need to be able to
+                // This is kind of hacky -- we need to be able to
                 // handle normalization within binders because
                 // otherwise we wind up a need to normalize when doing
                 // trait matching (since you can have a trait
-                // obligation like `for<'a> T::B : Fn(&'a int)`), but
+                // obligation like `for<'a> T::B: Fn(&'a i32)`), but
                 // we can't normalize with bound regions in scope. So
                 // far now we just ignore binders but only normalize
                 // if all bound regions are gone (and then we still
@@ -387,8 +410,12 @@ impl<'a, 'b, 'tcx> TypeFolder<'tcx> for AssocTypeNormalizer<'a, 'b, 'tcx> {
     }
 
     fn fold_const(&mut self, constant: &'tcx ty::Const<'tcx>) -> &'tcx ty::Const<'tcx> {
-        let constant = constant.super_fold_with(self);
-        constant.eval(self.selcx.tcx(), self.param_env)
+        if self.selcx.tcx().lazy_normalization() {
+            constant
+        } else {
+            let constant = constant.super_fold_with(self);
+            constant.eval(self.selcx.tcx(), self.param_env)
+        }
     }
 }
 
@@ -414,6 +441,8 @@ pub fn normalize_projection_type<'a, 'b, 'tcx>(
         depth,
         obligations,
     )
+    .ok()
+    .flatten()
     .unwrap_or_else(move || {
         // if we bottom out in ambiguity, create a type variable
         // and a deferred predicate to resolve this when more type
@@ -427,7 +456,7 @@ pub fn normalize_projection_type<'a, 'b, 'tcx>(
         });
         let projection = ty::Binder::dummy(ty::ProjectionPredicate { projection_ty, ty: ty_var });
         let obligation =
-            Obligation::with_depth(cause, depth + 1, param_env, projection.to_predicate());
+            Obligation::with_depth(cause, depth + 1, param_env, projection.to_predicate(tcx));
         obligations.push(obligation);
         ty_var
     })
@@ -450,7 +479,7 @@ fn opt_normalize_projection_type<'a, 'b, 'tcx>(
     cause: ObligationCause<'tcx>,
     depth: usize,
     obligations: &mut Vec<PredicateObligation<'tcx>>,
-) -> Option<Ty<'tcx>> {
+) -> Result<Option<Ty<'tcx>>, InProgress> {
     let infcx = selcx.infcx();
 
     let projection_ty = infcx.resolve_vars_if_possible(&projection_ty);
@@ -471,7 +500,7 @@ fn opt_normalize_projection_type<'a, 'b, 'tcx>(
     // bounds. It might be the case that we want two distinct caches,
     // or else another kind of cache entry.
 
-    let cache_result = infcx.inner.borrow_mut().projection_cache.try_start(cache_key);
+    let cache_result = infcx.inner.borrow_mut().projection_cache().try_start(cache_key);
     match cache_result {
         Ok(()) => {}
         Err(ProjectionCacheEntry::Ambiguous) => {
@@ -482,7 +511,7 @@ fn opt_normalize_projection_type<'a, 'b, 'tcx>(
                 "opt_normalize_projection_type: \
                  found cache entry: ambiguous"
             );
-            return None;
+            return Ok(None);
         }
         Err(ProjectionCacheEntry::InProgress) => {
             // If while normalized A::B, we are asked to normalize
@@ -497,24 +526,14 @@ fn opt_normalize_projection_type<'a, 'b, 'tcx>(
             // to normalize `A::B`, we will want to check the
             // where-clauses in scope. So we will try to unify `A::B`
             // with `A::B`, which can trigger a recursive
-            // normalization. In that case, I think we will want this code:
-            //
-            // ```
-            // let ty = selcx.tcx().mk_projection(projection_ty.item_def_id,
-            //                                    projection_ty.substs;
-            // return Some(NormalizedTy { value: v, obligations: vec![] });
-            // ```
+            // normalization.
 
             debug!(
                 "opt_normalize_projection_type: \
                  found cache entry: in-progress"
             );
 
-            // But for now, let's classify this as an overflow:
-            let recursion_limit = *selcx.tcx().sess.recursion_limit.get();
-            let obligation =
-                Obligation::with_depth(cause, recursion_limit, param_env, projection_ty);
-            selcx.infcx().report_overflow_error(&obligation, false);
+            return Err(InProgress);
         }
         Err(ProjectionCacheEntry::NormalizedTy(ty)) => {
             // This is the hottest path in this function.
@@ -537,7 +556,7 @@ fn opt_normalize_projection_type<'a, 'b, 'tcx>(
             // Once we have inferred everything we need to know, we
             // can ignore the `obligations` from that point on.
             if infcx.unresolved_type_vars(&ty.value).is_none() {
-                infcx.inner.borrow_mut().projection_cache.complete_normalized(cache_key, &ty);
+                infcx.inner.borrow_mut().projection_cache().complete_normalized(cache_key, &ty);
             // No need to extend `obligations`.
             } else {
                 obligations.extend(ty.obligations);
@@ -550,7 +569,7 @@ fn opt_normalize_projection_type<'a, 'b, 'tcx>(
                 cause,
                 depth,
             ));
-            return Some(ty.value);
+            return Ok(Some(ty.value));
         }
         Err(ProjectionCacheEntry::Error) => {
             debug!(
@@ -559,7 +578,7 @@ fn opt_normalize_projection_type<'a, 'b, 'tcx>(
             );
             let result = normalize_to_error(selcx, param_env, projection_ty, cause, depth);
             obligations.extend(result.obligations);
-            return Some(result.value);
+            return Ok(Some(result.value));
         }
     }
 
@@ -604,9 +623,9 @@ fn opt_normalize_projection_type<'a, 'b, 'tcx>(
             };
 
             let cache_value = prune_cache_value_obligations(infcx, &result);
-            infcx.inner.borrow_mut().projection_cache.insert_ty(cache_key, cache_value);
+            infcx.inner.borrow_mut().projection_cache().insert_ty(cache_key, cache_value);
             obligations.extend(result.obligations);
-            Some(result.value)
+            Ok(Some(result.value))
         }
         Ok(ProjectedTy::NoProgress(projected_ty)) => {
             debug!(
@@ -615,17 +634,17 @@ fn opt_normalize_projection_type<'a, 'b, 'tcx>(
                 projected_ty
             );
             let result = Normalized { value: projected_ty, obligations: vec![] };
-            infcx.inner.borrow_mut().projection_cache.insert_ty(cache_key, result.clone());
+            infcx.inner.borrow_mut().projection_cache().insert_ty(cache_key, result.clone());
             // No need to extend `obligations`.
-            Some(result.value)
+            Ok(Some(result.value))
         }
         Err(ProjectionTyError::TooManyCandidates) => {
             debug!(
                 "opt_normalize_projection_type: \
                  too many candidates"
             );
-            infcx.inner.borrow_mut().projection_cache.ambiguous(cache_key);
-            None
+            infcx.inner.borrow_mut().projection_cache().ambiguous(cache_key);
+            Ok(None)
         }
         Err(ProjectionTyError::TraitSelectionError(_)) => {
             debug!("opt_normalize_projection_type: ERROR");
@@ -634,10 +653,10 @@ fn opt_normalize_projection_type<'a, 'b, 'tcx>(
             // Trait`, which when processed will cause the error to be
             // reported later
 
-            infcx.inner.borrow_mut().projection_cache.error(cache_key);
+            infcx.inner.borrow_mut().projection_cache().error(cache_key);
             let result = normalize_to_error(selcx, param_env, projection_ty, cause, depth);
             obligations.extend(result.obligations);
-            Some(result.value)
+            Ok(Some(result.value))
         }
     }
 }
@@ -656,21 +675,25 @@ fn prune_cache_value_obligations<'a, 'tcx>(
     let mut obligations: Vec<_> = result
         .obligations
         .iter()
-        .filter(|obligation| match obligation.predicate {
-            // We found a `T: Foo<X = U>` predicate, let's check
-            // if `U` references any unresolved type
-            // variables. In principle, we only care if this
-            // projection can help resolve any of the type
-            // variables found in `result.value` -- but we just
-            // check for any type variables here, for fear of
-            // indirect obligations (e.g., we project to `?0`,
-            // but we have `T: Foo<X = ?1>` and `?1: Bar<X =
-            // ?0>`).
-            ty::Predicate::Projection(ref data) => infcx.unresolved_type_vars(&data.ty()).is_some(),
+        .filter(|obligation| {
+            match obligation.predicate.skip_binders() {
+                // We found a `T: Foo<X = U>` predicate, let's check
+                // if `U` references any unresolved type
+                // variables. In principle, we only care if this
+                // projection can help resolve any of the type
+                // variables found in `result.value` -- but we just
+                // check for any type variables here, for fear of
+                // indirect obligations (e.g., we project to `?0`,
+                // but we have `T: Foo<X = ?1>` and `?1: Bar<X =
+                // ?0>`).
+                ty::PredicateAtom::Projection(data) => {
+                    infcx.unresolved_type_vars(&ty::Binder::bind(data.ty)).is_some()
+                }
 
-            // We are only interested in `T: Foo<X = U>` predicates, whre
-            // `U` references one of `unresolved_type_vars`. =)
-            _ => false,
+                // We are only interested in `T: Foo<X = U>` predicates, whre
+                // `U` references one of `unresolved_type_vars`. =)
+                _ => false,
+            }
         })
         .cloned()
         .collect();
@@ -715,7 +738,7 @@ fn get_paranoid_cache_value_obligation<'a, 'tcx>(
         cause,
         recursion_depth: depth,
         param_env,
-        predicate: trait_ref.without_const().to_predicate(),
+        predicate: trait_ref.without_const().to_predicate(infcx.tcx),
     }
 }
 
@@ -750,7 +773,7 @@ fn normalize_to_error<'a, 'tcx>(
         cause,
         recursion_depth: depth,
         param_env,
-        predicate: trait_ref.without_const().to_predicate(),
+        predicate: trait_ref.without_const().to_predicate(selcx.tcx()),
     };
     let tcx = selcx.infcx().tcx;
     let def_id = projection_ty.item_def_id;
@@ -773,7 +796,7 @@ struct Progress<'tcx> {
 
 impl<'tcx> Progress<'tcx> {
     fn error(tcx: TyCtxt<'tcx>) -> Self {
-        Progress { ty: tcx.types.err, obligations: vec![] }
+        Progress { ty: tcx.ty_error(), obligations: vec![] }
     }
 
     fn with_addl_obligations(mut self, mut obligations: Vec<PredicateObligation<'tcx>>) -> Self {
@@ -803,8 +826,7 @@ fn project_type<'cx, 'tcx>(
 ) -> Result<ProjectedTy<'tcx>, ProjectionTyError<'tcx>> {
     debug!("project(obligation={:?})", obligation);
 
-    let recursion_limit = *selcx.tcx().sess.recursion_limit.get();
-    if obligation.recursion_depth >= recursion_limit {
+    if !selcx.tcx().sess.recursion_limit().value_within_limit(obligation.recursion_depth) {
         debug!("project: overflow!");
         return Err(ProjectionTyError::TraitSelectionError(SelectionError::Overflow));
     }
@@ -861,7 +883,7 @@ fn assemble_candidates_from_param_env<'cx, 'tcx>(
         obligation_trait_ref,
         candidate_set,
         ProjectionTyCandidate::ParamEnv,
-        obligation.param_env.caller_bounds.iter().cloned(),
+        obligation.param_env.caller_bounds().iter(),
     );
 }
 
@@ -885,9 +907,12 @@ fn assemble_candidates_from_trait_def<'cx, 'tcx>(
 
     let tcx = selcx.tcx();
     // Check whether the self-type is itself a projection.
-    let (def_id, substs) = match obligation_trait_ref.self_ty().kind {
-        ty::Projection(ref data) => (data.trait_ref(tcx).def_id, data.substs),
-        ty::Opaque(def_id, substs) => (def_id, substs),
+    // If so, extract what we know from the trait and try to come up with a good answer.
+    let bounds = match obligation_trait_ref.self_ty().kind {
+        ty::Projection(ref data) => {
+            tcx.projection_predicates(data.item_def_id).subst(tcx, data.substs)
+        }
+        ty::Opaque(def_id, substs) => tcx.projection_predicates(def_id).subst(tcx, substs),
         ty::Infer(ty::TyVar(_)) => {
             // If the self-type is an inference variable, then it MAY wind up
             // being a projected type, so induce an ambiguity.
@@ -897,35 +922,30 @@ fn assemble_candidates_from_trait_def<'cx, 'tcx>(
         _ => return,
     };
 
-    // If so, extract what we know from the trait and try to come up with a good answer.
-    let trait_predicates = tcx.predicates_of(def_id);
-    let bounds = trait_predicates.instantiate(tcx, substs);
-    let bounds = elaborate_predicates(tcx, bounds.predicates);
     assemble_candidates_from_predicates(
         selcx,
         obligation,
         obligation_trait_ref,
         candidate_set,
         ProjectionTyCandidate::TraitDef,
-        bounds,
+        bounds.iter(),
     )
 }
 
-fn assemble_candidates_from_predicates<'cx, 'tcx, I>(
+fn assemble_candidates_from_predicates<'cx, 'tcx>(
     selcx: &mut SelectionContext<'cx, 'tcx>,
     obligation: &ProjectionTyObligation<'tcx>,
     obligation_trait_ref: &ty::TraitRef<'tcx>,
     candidate_set: &mut ProjectionTyCandidateSet<'tcx>,
     ctor: fn(ty::PolyProjectionPredicate<'tcx>) -> ProjectionTyCandidate<'tcx>,
-    env_predicates: I,
-) where
-    I: IntoIterator<Item = ty::Predicate<'tcx>>,
-{
+    env_predicates: impl Iterator<Item = ty::Predicate<'tcx>>,
+) {
     debug!("assemble_candidates_from_predicates(obligation={:?})", obligation);
     let infcx = selcx.infcx();
     for predicate in env_predicates {
         debug!("assemble_candidates_from_predicates: predicate={:?}", predicate);
-        if let ty::Predicate::Projection(data) = predicate {
+        if let ty::PredicateAtom::Projection(data) = predicate.skip_binders() {
+            let data = ty::Binder::bind(data);
             let same_def_id = data.projection_def_id() == obligation.predicate.item_def_id;
 
             let is_match = same_def_id
@@ -966,8 +986,8 @@ fn assemble_candidates_from_impls<'cx, 'tcx>(
     let poly_trait_ref = obligation_trait_ref.to_poly_trait_ref();
     let trait_obligation = obligation.with(poly_trait_ref.to_poly_trait_predicate());
     let _ = selcx.infcx().commit_if_ok(|_| {
-        let vtable = match selcx.select(&trait_obligation) {
-            Ok(Some(vtable)) => vtable,
+        let impl_source = match selcx.select(&trait_obligation) {
+            Ok(Some(impl_source)) => impl_source,
             Ok(None) => {
                 candidate_set.mark_ambiguous();
                 return Err(());
@@ -979,16 +999,16 @@ fn assemble_candidates_from_impls<'cx, 'tcx>(
             }
         };
 
-        let eligible = match &vtable {
-            super::VtableClosure(_)
-            | super::VtableGenerator(_)
-            | super::VtableFnPointer(_)
-            | super::VtableObject(_)
-            | super::VtableTraitAlias(_) => {
-                debug!("assemble_candidates_from_impls: vtable={:?}", vtable);
+        let eligible = match &impl_source {
+            super::ImplSourceClosure(_)
+            | super::ImplSourceGenerator(_)
+            | super::ImplSourceFnPointer(_)
+            | super::ImplSourceObject(_)
+            | super::ImplSourceTraitAlias(_) => {
+                debug!("assemble_candidates_from_impls: impl_source={:?}", impl_source);
                 true
             }
-            super::VtableImpl(impl_data) => {
+            super::ImplSourceUserDefined(impl_data) => {
                 // We have to be careful when projecting out of an
                 // impl because of specialization. If we are not in
                 // codegen (i.e., projection mode is not "any"), and the
@@ -1023,7 +1043,7 @@ fn assemble_candidates_from_impls<'cx, 'tcx>(
                     // and the obligation is monomorphic, otherwise passes such as
                     // transmute checking and polymorphic MIR optimizations could
                     // get a result which isn't correct for all monomorphizations.
-                    if obligation.param_env.reveal == Reveal::All {
+                    if obligation.param_env.reveal() == Reveal::All {
                         // NOTE(eddyb) inference variables can resolve to parameters, so
                         // assume `poly_trait_ref` isn't monomorphic, if it contains any.
                         let poly_trait_ref =
@@ -1040,7 +1060,47 @@ fn assemble_candidates_from_impls<'cx, 'tcx>(
                     }
                 }
             }
-            super::VtableParam(..) => {
+            super::ImplSourceDiscriminantKind(..) => {
+                // While `DiscriminantKind` is automatically implemented for every type,
+                // the concrete discriminant may not be known yet.
+                //
+                // Any type with multiple potential discriminant types is therefore not eligible.
+                let self_ty = selcx.infcx().shallow_resolve(obligation.predicate.self_ty());
+
+                match self_ty.kind {
+                    ty::Bool
+                    | ty::Char
+                    | ty::Int(_)
+                    | ty::Uint(_)
+                    | ty::Float(_)
+                    | ty::Adt(..)
+                    | ty::Foreign(_)
+                    | ty::Str
+                    | ty::Array(..)
+                    | ty::Slice(_)
+                    | ty::RawPtr(..)
+                    | ty::Ref(..)
+                    | ty::FnDef(..)
+                    | ty::FnPtr(..)
+                    | ty::Dynamic(..)
+                    | ty::Closure(..)
+                    | ty::Generator(..)
+                    | ty::GeneratorWitness(..)
+                    | ty::Never
+                    | ty::Tuple(..)
+                    // Integers and floats always have `u8` as their discriminant.
+                    | ty::Infer(ty::InferTy::IntVar(_) | ty::InferTy::FloatVar(..)) => true,
+
+                    ty::Projection(..)
+                    | ty::Opaque(..)
+                    | ty::Param(..)
+                    | ty::Bound(..)
+                    | ty::Placeholder(..)
+                    | ty::Infer(..)
+                    | ty::Error(_) => false,
+                }
+            }
+            super::ImplSourceParam(..) => {
                 // This case tell us nothing about the value of an
                 // associated type. Consider:
                 //
@@ -1068,18 +1128,18 @@ fn assemble_candidates_from_impls<'cx, 'tcx>(
                 // in `assemble_candidates_from_param_env`.
                 false
             }
-            super::VtableAutoImpl(..) | super::VtableBuiltin(..) => {
+            super::ImplSourceAutoImpl(..) | super::ImplSourceBuiltin(..) => {
                 // These traits have no associated types.
-                span_bug!(
+                selcx.tcx().sess.delay_span_bug(
                     obligation.cause.span,
-                    "Cannot project an associated type from `{:?}`",
-                    vtable
+                    &format!("Cannot project an associated type from `{:?}`", impl_source),
                 );
+                return Err(());
             }
         };
 
         if eligible {
-            if candidate_set.push_candidate(ProjectionTyCandidate::Select(vtable)) {
+            if candidate_set.push_candidate(ProjectionTyCandidate::Select(impl_source)) {
                 Ok(())
             } else {
                 Err(())
@@ -1098,40 +1158,54 @@ fn confirm_candidate<'cx, 'tcx>(
 ) -> Progress<'tcx> {
     debug!("confirm_candidate(candidate={:?}, obligation={:?})", candidate, obligation);
 
-    match candidate {
+    let mut progress = match candidate {
         ProjectionTyCandidate::ParamEnv(poly_projection)
         | ProjectionTyCandidate::TraitDef(poly_projection) => {
             confirm_param_env_candidate(selcx, obligation, poly_projection)
         }
 
-        ProjectionTyCandidate::Select(vtable) => {
-            confirm_select_candidate(selcx, obligation, obligation_trait_ref, vtable)
+        ProjectionTyCandidate::Select(impl_source) => {
+            confirm_select_candidate(selcx, obligation, obligation_trait_ref, impl_source)
         }
+    };
+    // When checking for cycle during evaluation, we compare predicates with
+    // "syntactic" equality. Since normalization generally introduces a type
+    // with new region variables, we need to resolve them to existing variables
+    // when possible for this to work. See `auto-trait-projection-recursion.rs`
+    // for a case where this matters.
+    if progress.ty.has_infer_regions() {
+        progress.ty = OpportunisticRegionResolver::new(selcx.infcx()).fold_ty(progress.ty);
     }
+    progress
 }
 
 fn confirm_select_candidate<'cx, 'tcx>(
     selcx: &mut SelectionContext<'cx, 'tcx>,
     obligation: &ProjectionTyObligation<'tcx>,
     obligation_trait_ref: &ty::TraitRef<'tcx>,
-    vtable: Selection<'tcx>,
+    impl_source: Selection<'tcx>,
 ) -> Progress<'tcx> {
-    match vtable {
-        super::VtableImpl(data) => confirm_impl_candidate(selcx, obligation, data),
-        super::VtableGenerator(data) => confirm_generator_candidate(selcx, obligation, data),
-        super::VtableClosure(data) => confirm_closure_candidate(selcx, obligation, data),
-        super::VtableFnPointer(data) => confirm_fn_pointer_candidate(selcx, obligation, data),
-        super::VtableObject(_) => confirm_object_candidate(selcx, obligation, obligation_trait_ref),
-        super::VtableAutoImpl(..)
-        | super::VtableParam(..)
-        | super::VtableBuiltin(..)
-        | super::VtableTraitAlias(..) =>
+    match impl_source {
+        super::ImplSourceUserDefined(data) => confirm_impl_candidate(selcx, obligation, data),
+        super::ImplSourceGenerator(data) => confirm_generator_candidate(selcx, obligation, data),
+        super::ImplSourceClosure(data) => confirm_closure_candidate(selcx, obligation, data),
+        super::ImplSourceFnPointer(data) => confirm_fn_pointer_candidate(selcx, obligation, data),
+        super::ImplSourceDiscriminantKind(data) => {
+            confirm_discriminant_kind_candidate(selcx, obligation, data)
+        }
+        super::ImplSourceObject(_) => {
+            confirm_object_candidate(selcx, obligation, obligation_trait_ref)
+        }
+        super::ImplSourceAutoImpl(..)
+        | super::ImplSourceParam(..)
+        | super::ImplSourceBuiltin(..)
+        | super::ImplSourceTraitAlias(..) =>
         // we don't create Select candidates with this kind of resolution
         {
             span_bug!(
                 obligation.cause.span,
                 "Cannot project an associated type from `{:?}`",
-                vtable
+                impl_source
             )
         }
     }
@@ -1155,20 +1229,18 @@ fn confirm_object_candidate<'cx, 'tcx>(
     };
     let env_predicates = data
         .projection_bounds()
-        .map(|p| p.with_self_ty(selcx.tcx(), object_ty).to_predicate())
-        .collect();
+        .map(|p| p.with_self_ty(selcx.tcx(), object_ty).to_predicate(selcx.tcx()));
     let env_predicate = {
         let env_predicates = elaborate_predicates(selcx.tcx(), env_predicates);
 
         // select only those projections that are actually projecting an
         // item with the correct name
-        let env_predicates = env_predicates.filter_map(|p| match p {
-            ty::Predicate::Projection(data) => {
-                if data.projection_def_id() == obligation.predicate.item_def_id {
-                    Some(data)
-                } else {
-                    None
-                }
+
+        let env_predicates = env_predicates.filter_map(|o| match o.predicate.skip_binders() {
+            ty::PredicateAtom::Projection(data)
+                if data.projection_ty.item_def_id == obligation.predicate.item_def_id =>
+            {
+                Some(ty::Binder::bind(data))
             }
             _ => None,
         });
@@ -1208,9 +1280,9 @@ fn confirm_object_candidate<'cx, 'tcx>(
 fn confirm_generator_candidate<'cx, 'tcx>(
     selcx: &mut SelectionContext<'cx, 'tcx>,
     obligation: &ProjectionTyObligation<'tcx>,
-    vtable: VtableGeneratorData<'tcx, PredicateObligation<'tcx>>,
+    impl_source: ImplSourceGeneratorData<'tcx, PredicateObligation<'tcx>>,
 ) -> Progress<'tcx> {
-    let gen_sig = vtable.substs.as_generator().poly_sig();
+    let gen_sig = impl_source.substs.as_generator().poly_sig();
     let Normalized { value: gen_sig, obligations } = normalize_with_depth(
         selcx,
         obligation.param_env,
@@ -1226,7 +1298,7 @@ fn confirm_generator_candidate<'cx, 'tcx>(
 
     let tcx = selcx.tcx();
 
-    let gen_def_id = tcx.lang_items().gen_trait().unwrap();
+    let gen_def_id = tcx.require_lang_item(LangItem::Generator, None);
 
     let predicate = super::util::generator_trait_ref_and_outputs(
         tcx,
@@ -1254,16 +1326,36 @@ fn confirm_generator_candidate<'cx, 'tcx>(
     });
 
     confirm_param_env_candidate(selcx, obligation, predicate)
-        .with_addl_obligations(vtable.nested)
+        .with_addl_obligations(impl_source.nested)
         .with_addl_obligations(obligations)
+}
+
+fn confirm_discriminant_kind_candidate<'cx, 'tcx>(
+    selcx: &mut SelectionContext<'cx, 'tcx>,
+    obligation: &ProjectionTyObligation<'tcx>,
+    _: ImplSourceDiscriminantKindData,
+) -> Progress<'tcx> {
+    let tcx = selcx.tcx();
+
+    let self_ty = selcx.infcx().shallow_resolve(obligation.predicate.self_ty());
+    let substs = tcx.mk_substs([self_ty.into()].iter());
+
+    let discriminant_def_id = tcx.require_lang_item(LangItem::Discriminant, None);
+
+    let predicate = ty::ProjectionPredicate {
+        projection_ty: ty::ProjectionTy { substs, item_def_id: discriminant_def_id },
+        ty: self_ty.discriminant_ty(tcx),
+    };
+
+    confirm_param_env_candidate(selcx, obligation, ty::Binder::bind(predicate))
 }
 
 fn confirm_fn_pointer_candidate<'cx, 'tcx>(
     selcx: &mut SelectionContext<'cx, 'tcx>,
     obligation: &ProjectionTyObligation<'tcx>,
-    fn_pointer_vtable: VtableFnPointerData<'tcx, PredicateObligation<'tcx>>,
+    fn_pointer_impl_source: ImplSourceFnPointerData<'tcx, PredicateObligation<'tcx>>,
 ) -> Progress<'tcx> {
-    let fn_type = selcx.infcx().shallow_resolve(fn_pointer_vtable.fn_ty);
+    let fn_type = selcx.infcx().shallow_resolve(fn_pointer_impl_source.fn_ty);
     let sig = fn_type.fn_sig(selcx.tcx());
     let Normalized { value: sig, obligations } = normalize_with_depth(
         selcx,
@@ -1274,16 +1366,16 @@ fn confirm_fn_pointer_candidate<'cx, 'tcx>(
     );
 
     confirm_callable_candidate(selcx, obligation, sig, util::TupleArgumentsFlag::Yes)
-        .with_addl_obligations(fn_pointer_vtable.nested)
+        .with_addl_obligations(fn_pointer_impl_source.nested)
         .with_addl_obligations(obligations)
 }
 
 fn confirm_closure_candidate<'cx, 'tcx>(
     selcx: &mut SelectionContext<'cx, 'tcx>,
     obligation: &ProjectionTyObligation<'tcx>,
-    vtable: VtableClosureData<'tcx, PredicateObligation<'tcx>>,
+    impl_source: ImplSourceClosureData<'tcx, PredicateObligation<'tcx>>,
 ) -> Progress<'tcx> {
-    let closure_sig = vtable.substs.as_closure().sig();
+    let closure_sig = impl_source.substs.as_closure().sig();
     let Normalized { value: closure_sig, obligations } = normalize_with_depth(
         selcx,
         obligation.param_env,
@@ -1298,7 +1390,7 @@ fn confirm_closure_candidate<'cx, 'tcx>(
     );
 
     confirm_callable_candidate(selcx, obligation, closure_sig, util::TupleArgumentsFlag::No)
-        .with_addl_obligations(vtable.nested)
+        .with_addl_obligations(impl_source.nested)
         .with_addl_obligations(obligations)
 }
 
@@ -1312,8 +1404,8 @@ fn confirm_callable_candidate<'cx, 'tcx>(
 
     debug!("confirm_callable_candidate({:?},{:?})", obligation, fn_sig);
 
-    // the `Output` associated type is declared on `FnOnce`
-    let fn_once_def_id = tcx.lang_items().fn_once_trait().unwrap();
+    let fn_once_def_id = tcx.require_lang_item(LangItem::FnOnce, None);
+    let fn_once_output_def_id = tcx.require_lang_item(LangItem::FnOnceOutput, None);
 
     let predicate = super::util::closure_trait_ref_and_return_type(
         tcx,
@@ -1323,11 +1415,10 @@ fn confirm_callable_candidate<'cx, 'tcx>(
         flag,
     )
     .map_bound(|(trait_ref, ret_type)| ty::ProjectionPredicate {
-        projection_ty: ty::ProjectionTy::from_ref_and_name(
-            tcx,
-            trait_ref,
-            Ident::with_dummy_span(rustc_hir::FN_OUTPUT_NAME),
-        ),
+        projection_ty: ty::ProjectionTy {
+            substs: trait_ref.substs,
+            item_def_id: fn_once_output_def_id,
+        },
         ty: ret_type,
     });
 
@@ -1359,8 +1450,8 @@ fn confirm_param_env_candidate<'cx, 'tcx>(
                 obligation, poly_cache_entry, e,
             );
             debug!("confirm_param_env_candidate: {}", msg);
-            infcx.tcx.sess.delay_span_bug(obligation.cause.span, &msg);
-            Progress { ty: infcx.tcx.types.err, obligations: vec![] }
+            let err = infcx.tcx.ty_error_with_message(obligation.cause.span, &msg);
+            Progress { ty: err, obligations: vec![] }
         }
     }
 }
@@ -1368,18 +1459,18 @@ fn confirm_param_env_candidate<'cx, 'tcx>(
 fn confirm_impl_candidate<'cx, 'tcx>(
     selcx: &mut SelectionContext<'cx, 'tcx>,
     obligation: &ProjectionTyObligation<'tcx>,
-    impl_vtable: VtableImplData<'tcx, PredicateObligation<'tcx>>,
+    impl_impl_source: ImplSourceUserDefinedData<'tcx, PredicateObligation<'tcx>>,
 ) -> Progress<'tcx> {
     let tcx = selcx.tcx();
 
-    let VtableImplData { impl_def_id, substs, nested } = impl_vtable;
+    let ImplSourceUserDefinedData { impl_def_id, substs, nested } = impl_impl_source;
     let assoc_item_id = obligation.predicate.item_def_id;
     let trait_def_id = tcx.trait_id_of_impl(impl_def_id).unwrap();
 
     let param_env = obligation.param_env;
     let assoc_ty = match assoc_ty_def(selcx, impl_def_id, assoc_item_id) {
         Ok(assoc_ty) => assoc_ty,
-        Err(ErrorReported) => return Progress { ty: tcx.types.err, obligations: nested },
+        Err(ErrorReported) => return Progress { ty: tcx.ty_error(), obligations: nested },
     };
 
     if !assoc_ty.item.defaultness.has_value() {
@@ -1391,21 +1482,24 @@ fn confirm_impl_candidate<'cx, 'tcx>(
             "confirm_impl_candidate: no associated type {:?} for {:?}",
             assoc_ty.item.ident, obligation.predicate
         );
-        return Progress { ty: tcx.types.err, obligations: nested };
+        return Progress { ty: tcx.ty_error(), obligations: nested };
     }
+    // If we're trying to normalize `<Vec<u32> as X>::A<S>` using
+    //`impl<T> X for Vec<T> { type A<Y> = Box<Y>; }`, then:
+    //
+    // * `obligation.predicate.substs` is `[Vec<u32>, S]`
+    // * `substs` is `[u32]`
+    // * `substs` ends up as `[u32, S]`
     let substs = obligation.predicate.substs.rebase_onto(tcx, trait_def_id, substs);
     let substs =
         translate_substs(selcx.infcx(), param_env, impl_def_id, substs, assoc_ty.defining_node);
-    let ty = if let ty::AssocKind::OpaqueTy = assoc_ty.item.kind {
-        let item_substs = InternalSubsts::identity_for_item(tcx, assoc_ty.item.def_id);
-        tcx.mk_opaque(assoc_ty.item.def_id, item_substs)
-    } else {
-        tcx.type_of(assoc_ty.item.def_id)
-    };
+    let ty = tcx.type_of(assoc_ty.item.def_id);
     if substs.len() != tcx.generics_of(assoc_ty.item.def_id).count() {
-        tcx.sess
-            .delay_span_bug(DUMMY_SP, "impl item and trait item have different parameter counts");
-        Progress { ty: tcx.types.err, obligations: nested }
+        let err = tcx.ty_error_with_message(
+            DUMMY_SP,
+            "impl item and trait item have different parameter counts",
+        );
+        Progress { ty: err, obligations: nested }
     } else {
         Progress { ty: ty.subst(tcx, substs), obligations: nested }
     }
@@ -1434,7 +1528,7 @@ fn assoc_ty_def(
     // cycle error if the specialization graph is currently being built.
     let impl_node = specialization_graph::Node::Impl(impl_def_id);
     for item in impl_node.items(tcx) {
-        if matches!(item.kind, ty::AssocKind::Type | ty::AssocKind::OpaqueTy)
+        if matches!(item.kind, ty::AssocKind::Type)
             && tcx.hygienic_eq(item.ident, assoc_ty_name, trait_def_id)
         {
             return Ok(specialization_graph::LeafDef {
@@ -1462,14 +1556,14 @@ fn assoc_ty_def(
 crate trait ProjectionCacheKeyExt<'tcx>: Sized {
     fn from_poly_projection_predicate(
         selcx: &mut SelectionContext<'cx, 'tcx>,
-        predicate: &ty::PolyProjectionPredicate<'tcx>,
+        predicate: ty::PolyProjectionPredicate<'tcx>,
     ) -> Option<Self>;
 }
 
 impl<'tcx> ProjectionCacheKeyExt<'tcx> for ProjectionCacheKey<'tcx> {
     fn from_poly_projection_predicate(
         selcx: &mut SelectionContext<'cx, 'tcx>,
-        predicate: &ty::PolyProjectionPredicate<'tcx>,
+        predicate: ty::PolyProjectionPredicate<'tcx>,
     ) -> Option<Self> {
         let infcx = selcx.infcx();
         // We don't do cross-snapshot caching of obligations with escaping regions,

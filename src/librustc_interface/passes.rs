@@ -2,12 +2,13 @@ use crate::interface::{Compiler, Result};
 use crate::proc_macro_decls;
 use crate::util;
 
-use log::{info, log_enabled, warn};
+use once_cell::sync::Lazy;
 use rustc_ast::mut_visit::MutVisitor;
-use rustc_ast::{self, ast, visit};
+use rustc_ast::{self as ast, visit};
 use rustc_codegen_ssa::back::link::emit_metadata;
 use rustc_codegen_ssa::traits::CodegenBackend;
-use rustc_data_structures::sync::{par_iter, Lrc, Once, ParallelIterator, WorkerLocal};
+use rustc_data_structures::sync::{par_iter, Lrc, OnceCell, ParallelIterator, WorkerLocal};
+use rustc_data_structures::temp_dir::MaybeTempDir;
 use rustc_data_structures::{box_region_allow_access, declare_box_region_type, parallel};
 use rustc_errors::{ErrorReported, PResult};
 use rustc_expand::base::ExtCtxt;
@@ -19,6 +20,7 @@ use rustc_middle::arena::Arena;
 use rustc_middle::dep_graph::DepGraph;
 use rustc_middle::middle;
 use rustc_middle::middle::cstore::{CrateStore, MetadataLoader, MetadataLoaderDyn};
+use rustc_middle::ty::query::Providers;
 use rustc_middle::ty::steal::Steal;
 use rustc_middle::ty::{self, GlobalCtxt, ResolverOutputs, TyCtxt};
 use rustc_mir as mir;
@@ -27,17 +29,15 @@ use rustc_parse::{parse_crate_from_file, parse_crate_from_source_str};
 use rustc_passes::{self, hir_stats, layout_test};
 use rustc_plugin_impl as plugin;
 use rustc_resolve::{Resolver, ResolverArenas};
-use rustc_session::config::{
-    self, CrateType, Input, OutputFilenames, OutputType, PpMode, PpSourceMode,
-};
-use rustc_session::lint;
+use rustc_session::config::{CrateType, Input, OutputFilenames, OutputType, PpMode, PpSourceMode};
 use rustc_session::output::{filename_for_input, filename_for_metadata};
 use rustc_session::search_paths::PathKind;
 use rustc_session::Session;
 use rustc_span::symbol::Symbol;
-use rustc_span::FileName;
+use rustc_span::{FileName, RealFileName};
 use rustc_trait_selection::traits;
 use rustc_typeck as typeck;
+use tracing::{info, warn};
 
 use rustc_serialize::json;
 use tempfile::Builder as TempFileBuilder;
@@ -103,13 +103,15 @@ pub fn configure_and_expand(
     krate: ast::Crate,
     crate_name: &str,
 ) -> Result<(ast::Crate, BoxedResolver)> {
+    tracing::trace!("configure_and_expand");
     // Currently, we ignore the name resolution data structures for the purposes of dependency
     // tracking. Instead we will run name resolution and include its output in the hash of each
     // item, much like we do for macro expansion. In other words, the hash reflects not just
     // its contents but the results of name resolution on those contents. Hopefully we'll push
     // this back at some point.
     let crate_name = crate_name.to_string();
-    let (result, resolver) = BoxedResolver::new(static move || {
+    let (result, resolver) = BoxedResolver::new(static move |mut action| {
+        let _ = action;
         let sess = &*sess;
         let resolver_arenas = Resolver::arenas();
         let res = configure_and_expand_inner(
@@ -126,11 +128,11 @@ pub fn configure_and_expand(
                 panic!()
             }
             Ok((krate, resolver)) => {
-                yield BoxedResolver::initial_yield(Ok(krate));
+                action = yield BoxedResolver::initial_yield(Ok(krate));
                 resolver
             }
         };
-        box_region_allow_access!(for(), (&mut Resolver<'_>), (&mut resolver));
+        box_region_allow_access!(for(), (&mut Resolver<'_>), (&mut resolver), action);
         resolver.into_outputs()
     });
     result.map(|k| (k, resolver))
@@ -160,20 +162,15 @@ pub fn register_plugins<'a>(
         )
     });
 
-    let (krate, features) = rustc_expand::config::features(
-        krate,
-        &sess.parse_sess,
-        sess.edition(),
-        &sess.opts.debugging_opts.allow_features,
-    );
+    let (krate, features) = rustc_expand::config::features(sess, krate);
     // these need to be set "early" so that expansion sees `quote` if enabled.
     sess.init_features(features);
 
     let crate_types = util::collect_crate_types(sess, &krate.attrs);
-    sess.crate_types.set(crate_types);
+    sess.init_crate_types(crate_types);
 
     let disambiguator = util::compute_crate_disambiguator(sess);
-    sess.crate_disambiguator.set(disambiguator);
+    sess.crate_disambiguator.set(disambiguator).expect("not yet initialized");
     rustc_incremental::prepare_session_directory(sess, &crate_name, disambiguator);
 
     if sess.opts.incremental.is_some() {
@@ -231,6 +228,7 @@ fn configure_and_expand_inner<'a>(
     resolver_arenas: &'a ResolverArenas<'a>,
     metadata_loader: &'a MetadataLoaderDyn,
 ) -> Result<(ast::Crate, Resolver<'a>)> {
+    tracing::trace!("configure_and_expand_inner");
     pre_expansion_lint(sess, lint_store, &krate);
 
     let mut resolver = Resolver::new(sess, &krate, crate_name, metadata_loader, &resolver_arenas);
@@ -241,16 +239,16 @@ fn configure_and_expand_inner<'a>(
         let (krate, name) = rustc_builtin_macros::standard_library_imports::inject(
             krate,
             &mut resolver,
-            &sess.parse_sess,
+            &sess,
             alt_std_name,
         );
         if let Some(name) = name {
-            sess.parse_sess.injected_crate_name.set(name);
+            sess.parse_sess.injected_crate_name.set(name).expect("not yet initialized");
         }
         krate
     });
 
-    util::check_attr_crate_type(&krate.attrs, &mut resolver.lint_buffer());
+    util::check_attr_crate_type(&sess, &krate.attrs, &mut resolver.lint_buffer());
 
     // Expand all macros
     krate = sess.time("macro_expand_crate", || {
@@ -289,14 +287,15 @@ fn configure_and_expand_inner<'a>(
         let features = sess.features_untracked();
         let cfg = rustc_expand::expand::ExpansionConfig {
             features: Some(&features),
-            recursion_limit: *sess.recursion_limit.get(),
+            recursion_limit: sess.recursion_limit(),
             trace_mac: sess.opts.debugging_opts.trace_macros,
             should_test: sess.opts.test,
+            span_debug: sess.opts.debugging_opts.span_debug,
             ..rustc_expand::expand::ExpansionConfig::default(crate_name.to_string())
         };
 
         let extern_mod_loaded = |k: &ast::Crate| pre_expansion_lint(sess, lint_store, k);
-        let mut ecx = ExtCtxt::new(&sess.parse_sess, cfg, &mut resolver, Some(&extern_mod_loaded));
+        let mut ecx = ExtCtxt::new(&sess, cfg, &mut resolver, Some(&extern_mod_loaded));
 
         // Expand macros now!
         let krate = sess.time("expand_crate", || ecx.monotonic_expander().expand_crate(krate));
@@ -307,21 +306,11 @@ fn configure_and_expand_inner<'a>(
             ecx.check_unused_macros();
         });
 
-        let mut missing_fragment_specifiers: Vec<_> =
-            ecx.parse_sess.missing_fragment_specifiers.borrow().iter().cloned().collect();
-        missing_fragment_specifiers.sort();
-
-        let recursion_limit_hit = ecx.reduced_recursion_limit.is_some();
-
-        for span in missing_fragment_specifiers {
-            let lint = lint::builtin::MISSING_FRAGMENT_SPECIFIER;
-            let msg = "missing fragment specifier";
-            resolver.lint_buffer().buffer_lint(lint, ast::CRATE_NODE_ID, span, msg);
-        }
         if cfg!(windows) {
             env::set_var("PATH", &old_path);
         }
 
+        let recursion_limit_hit = ecx.reduced_recursion_limit.is_some();
         if recursion_limit_hit {
             // If we hit a recursion limit, exit early to avoid later passes getting overwhelmed
             // with a large AST
@@ -332,26 +321,11 @@ fn configure_and_expand_inner<'a>(
     })?;
 
     sess.time("maybe_building_test_harness", || {
-        rustc_builtin_macros::test_harness::inject(
-            &sess.parse_sess,
-            &mut resolver,
-            sess.opts.test,
-            &mut krate,
-            sess.diagnostic(),
-            &sess.features_untracked(),
-            sess.panic_strategy(),
-            sess.target.target.options.panic_strategy,
-            sess.opts.debugging_opts.panic_abort_tests,
-        )
+        rustc_builtin_macros::test_harness::inject(&sess, &mut resolver, &mut krate)
     });
 
-    // If we're actually rustdoc then there's no need to actually compile
-    // anything, so switch everything to just looping
-    let mut should_loop = sess.opts.actually_rustdoc;
     if let Some(PpMode::PpmSource(PpSourceMode::PpmEveryBodyLoops)) = sess.opts.pretty {
-        should_loop |= true;
-    }
-    if should_loop {
+        tracing::debug!("replacing bodies with loop {{}}");
         util::ReplaceBodyWithLoop::new(&mut resolver).visit_crate(&mut krate);
     }
 
@@ -359,8 +333,8 @@ fn configure_and_expand_inner<'a>(
         rustc_ast_passes::ast_validation::check_crate(sess, &krate, &mut resolver.lint_buffer())
     });
 
-    let crate_types = sess.crate_types.borrow();
-    let is_proc_macro_crate = crate_types.contains(&config::CrateType::ProcMacro);
+    let crate_types = sess.crate_types();
+    let is_proc_macro_crate = crate_types.contains(&CrateType::ProcMacro);
 
     // For backwards compatibility, we don't try to run proc macro injection
     // if rustdoc is run on a proc macro crate without '--crate-type proc-macro' being
@@ -381,7 +355,7 @@ fn configure_and_expand_inner<'a>(
             let num_crate_types = crate_types.len();
             let is_test_crate = sess.opts.test;
             rustc_builtin_macros::proc_macro_harness::inject(
-                &sess.parse_sess,
+                &sess,
                 &mut resolver,
                 krate,
                 is_proc_macro_crate,
@@ -411,12 +385,7 @@ fn configure_and_expand_inner<'a>(
 
     // Needs to go *after* expansion to be able to check the results of macro expansion.
     sess.time("complete_gated_feature_checking", || {
-        rustc_ast_passes::feature_gate::check_crate(
-            &krate,
-            &sess.parse_sess,
-            &sess.features_untracked(),
-            sess.opts.unstable_features,
-        );
+        rustc_ast_passes::feature_gate::check_crate(&krate, sess);
     });
 
     // Add all buffered lints from the `ParseSess` to the `Session`.
@@ -489,7 +458,7 @@ fn generated_output_paths(
             // If the filename has been overridden using `-o`, it will not be modified
             // by appending `.rlib`, `.exe`, etc., so we can skip this transformation.
             OutputType::Exe if !exact_name => {
-                for crate_type in sess.crate_types.borrow().iter() {
+                for crate_type in sess.crate_types().iter() {
                     let p = filename_for_input(sess, *crate_type, crate_name, outputs);
                     out_filenames.push(p);
                 }
@@ -541,6 +510,22 @@ fn escape_dep_filename(filename: &FileName) -> String {
     filename.to_string().replace(" ", "\\ ")
 }
 
+// Makefile comments only need escaping newlines and `\`.
+// The result can be unescaped by anything that can unescape `escape_default` and friends.
+fn escape_dep_env(symbol: Symbol) -> String {
+    let s = symbol.as_str();
+    let mut escaped = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\n' => escaped.push_str(r"\n"),
+            '\r' => escaped.push_str(r"\r"),
+            '\\' => escaped.push_str(r"\\"),
+            _ => escaped.push(c),
+        }
+    }
+    escaped
+}
+
 fn write_out_deps(
     sess: &Session,
     boxed_resolver: &Steal<Rc<RefCell<BoxedResolver>>>,
@@ -570,13 +555,16 @@ fn write_out_deps(
                 for cnum in resolver.cstore().crates_untracked() {
                     let source = resolver.cstore().crate_source_untracked(cnum);
                     if let Some((path, _)) = source.dylib {
-                        files.push(escape_dep_filename(&FileName::Real(path)));
+                        let file_name = FileName::Real(RealFileName::Named(path));
+                        files.push(escape_dep_filename(&file_name));
                     }
                     if let Some((path, _)) = source.rlib {
-                        files.push(escape_dep_filename(&FileName::Real(path)));
+                        let file_name = FileName::Real(RealFileName::Named(path));
+                        files.push(escape_dep_filename(&file_name));
                     }
                     if let Some((path, _)) = source.rmeta {
-                        files.push(escape_dep_filename(&FileName::Real(path)));
+                        let file_name = FileName::Real(RealFileName::Named(path));
+                        files.push(escape_dep_filename(&file_name));
                     }
                 }
             });
@@ -593,6 +581,25 @@ fn write_out_deps(
         for path in files {
             writeln!(file, "{}:", path)?;
         }
+
+        // Emit special comments with information about accessed environment variables.
+        let env_depinfo = sess.parse_sess.env_depinfo.borrow();
+        if !env_depinfo.is_empty() {
+            let mut envs: Vec<_> = env_depinfo
+                .iter()
+                .map(|(k, v)| (escape_dep_env(*k), v.map(escape_dep_env)))
+                .collect();
+            envs.sort_unstable();
+            writeln!(file)?;
+            for (k, v) in envs {
+                write!(file, "# env-dep:{}", k)?;
+                if let Some(v) = v {
+                    write!(file, "={}", v)?;
+                }
+                writeln!(file)?;
+            }
+        }
+
         Ok(())
     })();
 
@@ -673,7 +680,8 @@ pub fn prepare_outputs(
     Ok(outputs)
 }
 
-pub fn default_provide(providers: &mut ty::query::Providers<'_>) {
+pub static DEFAULT_QUERY_PROVIDERS: Lazy<Providers> = Lazy::new(|| {
+    let providers = &mut Providers::default();
     providers.analysis = analysis;
     proc_macro_decls::provide(providers);
     plugin::build::provide(providers);
@@ -692,12 +700,15 @@ pub fn default_provide(providers: &mut ty::query::Providers<'_>) {
     rustc_lint::provide(providers);
     rustc_symbol_mangling::provide(providers);
     rustc_codegen_ssa::provide(providers);
-}
+    *providers
+});
 
-pub fn default_provide_extern(providers: &mut ty::query::Providers<'_>) {
-    rustc_metadata::provide_extern(providers);
-    rustc_codegen_ssa::provide_extern(providers);
-}
+pub static DEFAULT_EXTERN_QUERY_PROVIDERS: Lazy<Providers> = Lazy::new(|| {
+    let mut extern_providers = *DEFAULT_QUERY_PROVIDERS;
+    rustc_metadata::provide_extern(&mut extern_providers);
+    rustc_codegen_ssa::provide_extern(&mut extern_providers);
+    extern_providers
+});
 
 pub struct QueryContext<'tcx>(&'tcx GlobalCtxt<'tcx>);
 
@@ -706,7 +717,8 @@ impl<'tcx> QueryContext<'tcx> {
     where
         F: FnOnce(TyCtxt<'tcx>) -> R,
     {
-        ty::tls::enter_global(self.0, f)
+        let icx = ty::tls::ImplicitCtxt::new(self.0);
+        ty::tls::enter_context(&icx, |_| f(icx.tcx))
     }
 
     pub fn print_stats(&mut self) {
@@ -722,21 +734,23 @@ pub fn create_global_ctxt<'tcx>(
     mut resolver_outputs: ResolverOutputs,
     outputs: OutputFilenames,
     crate_name: &str,
-    global_ctxt: &'tcx Once<GlobalCtxt<'tcx>>,
+    global_ctxt: &'tcx OnceCell<GlobalCtxt<'tcx>>,
     arena: &'tcx WorkerLocal<Arena<'tcx>>,
 ) -> QueryContext<'tcx> {
     let sess = &compiler.session();
-    let defs: &'tcx Definitions = arena.alloc(mem::take(&mut resolver_outputs.definitions));
+    let defs: &'tcx Definitions = arena.alloc(mem::replace(
+        &mut resolver_outputs.definitions,
+        Definitions::new(crate_name, sess.local_crate_disambiguator()),
+    ));
 
     let query_result_on_disk_cache = rustc_incremental::load_query_result_cache(sess);
 
     let codegen_backend = compiler.codegen_backend();
-    let mut local_providers = ty::query::Providers::default();
-    default_provide(&mut local_providers);
+    let mut local_providers = *DEFAULT_QUERY_PROVIDERS;
     codegen_backend.provide(&mut local_providers);
 
-    let mut extern_providers = local_providers;
-    default_provide_extern(&mut extern_providers);
+    let mut extern_providers = *DEFAULT_EXTERN_QUERY_PROVIDERS;
+    codegen_backend.provide(&mut extern_providers);
     codegen_backend.provide_extern(&mut extern_providers);
 
     if let Some(callback) = compiler.override_queries {
@@ -744,7 +758,7 @@ pub fn create_global_ctxt<'tcx>(
     }
 
     let gcx = sess.time("setup_global_ctxt", || {
-        global_ctxt.init_locking(|| {
+        global_ctxt.get_or_init(|| {
             TyCtxt::create_global_ctxt(
                 sess,
                 lint_store,
@@ -763,8 +777,9 @@ pub fn create_global_ctxt<'tcx>(
     });
 
     // Do some initialization of the DepGraph that can only be done with the tcx available.
-    ty::tls::enter_global(&gcx, |tcx| {
-        tcx.sess.time("dep_graph_tcx_init", || rustc_incremental::dep_graph_tcx_init(tcx));
+    let icx = ty::tls::ImplicitCtxt::new(&gcx);
+    ty::tls::enter_context(&icx, |_| {
+        icx.tcx.sess.time("dep_graph_tcx_init", || rustc_incremental::dep_graph_tcx_init(icx.tcx));
     });
 
     QueryContext(gcx)
@@ -812,7 +827,7 @@ fn analysis(tcx: TyCtxt<'_>, cnum: CrateNum) -> Result<()> {
             {
                 sess.time("match_checking", || {
                     tcx.par_body_owners(|def_id| {
-                        tcx.ensure().check_match(def_id);
+                        tcx.ensure().check_match(def_id.to_def_id());
                     });
                 });
             },
@@ -837,13 +852,14 @@ fn analysis(tcx: TyCtxt<'_>, cnum: CrateNum) -> Result<()> {
         tcx.par_body_owners(|def_id| tcx.ensure().mir_borrowck(def_id));
     });
 
-    sess.time("dumping_chalk_like_clauses", || {
-        rustc_traits::lowering::dump_program_clauses(tcx);
-    });
-
     sess.time("MIR_effect_checking", || {
         for def_id in tcx.body_owners() {
-            mir::transform::check_unsafety::check_unsafety(tcx, def_id)
+            mir::transform::check_unsafety::check_unsafety(tcx, def_id);
+
+            if tcx.hir().body_const_context(def_id).is_some() {
+                tcx.ensure()
+                    .mir_drops_elaborated_and_const_checked(ty::WithOptConstParam::unknown(def_id));
+            }
         }
     });
 
@@ -910,8 +926,7 @@ fn encode_and_write_metadata(
 
     let metadata_kind = tcx
         .sess
-        .crate_types
-        .borrow()
+        .crate_types()
         .iter()
         .map(|ty| match *ty {
             CrateType::Executable | CrateType::Staticlib | CrateType::Cdylib => MetadataKind::None,
@@ -943,6 +958,7 @@ fn encode_and_write_metadata(
             .prefix("rmeta")
             .tempdir_in(out_filename.parent().unwrap())
             .unwrap_or_else(|err| tcx.sess.fatal(&format!("couldn't create a temp dir: {}", err)));
+        let metadata_tmpdir = MaybeTempDir::new(metadata_tmpdir, tcx.sess.opts.cg.save_temps);
         let metadata_filename = emit_metadata(tcx.sess, &metadata, &metadata_tmpdir);
         if let Err(e) = fs::rename(&metadata_filename, &out_filename) {
             tcx.sess.fatal(&format!("failed to write {}: {}", out_filename.display(), e));
@@ -967,10 +983,7 @@ pub fn start_codegen<'tcx>(
     tcx: TyCtxt<'tcx>,
     outputs: &OutputFilenames,
 ) -> Box<dyn Any> {
-    if log_enabled!(::log::Level::Info) {
-        println!("Pre-codegen");
-        tcx.print_debug_stats();
-    }
+    info!("Pre-codegen\n{:?}", tcx.debug_stats());
 
     let (metadata, need_metadata_module) = encode_and_write_metadata(tcx, outputs);
 
@@ -978,10 +991,7 @@ pub fn start_codegen<'tcx>(
         codegen_backend.codegen_crate(tcx, metadata, need_metadata_module)
     });
 
-    if log_enabled!(::log::Level::Info) {
-        println!("Post-codegen");
-        tcx.print_debug_stats();
-    }
+    info!("Post-codegen\n{:?}", tcx.debug_stats());
 
     if tcx.sess.opts.output_types.contains_key(&OutputType::Mir) {
         if let Err(e) = mir::transform::dump_mir::emit_mir(tcx, outputs) {

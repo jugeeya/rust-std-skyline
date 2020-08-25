@@ -6,6 +6,8 @@ use rustc_middle::ty;
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_target::abi::{FieldsShape, VariantIdx, Variants};
 
+use std::num::NonZeroUsize;
+
 use super::{InterpCx, MPlaceTy, Machine, OpTy};
 
 // A thing that we can project into, and that has a layout.
@@ -35,7 +37,7 @@ pub trait Value<'mir, 'tcx, M: Machine<'mir, 'tcx>>: Copy {
 
 // Operands and memory-places are both values.
 // Places in general are not due to `place_field` having to do `force_allocation`.
-impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> Value<'mir, 'tcx, M> for OpTy<'tcx, M::PointerTag> {
+impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> Value<'mir, 'tcx, M> for OpTy<'tcx, M::PointerTag> {
     #[inline(always)]
     fn layout(&self) -> TyAndLayout<'tcx> {
         self.layout
@@ -73,7 +75,9 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> Value<'mir, 'tcx, M> for OpTy<'tcx, M::
     }
 }
 
-impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> Value<'mir, 'tcx, M> for MPlaceTy<'tcx, M::PointerTag> {
+impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> Value<'mir, 'tcx, M>
+    for MPlaceTy<'tcx, M::PointerTag>
+{
     #[inline(always)]
     fn layout(&self) -> TyAndLayout<'tcx> {
         self.layout
@@ -121,6 +125,15 @@ macro_rules! make_value_visitor {
             fn ecx(&$($mutability)? self)
                 -> &$($mutability)? InterpCx<'mir, 'tcx, M>;
 
+            /// `read_discriminant` can be hooked for better error messages.
+            #[inline(always)]
+            fn read_discriminant(
+                &mut self,
+                op: OpTy<'tcx, M::PointerTag>,
+            ) -> InterpResult<'tcx, VariantIdx> {
+                Ok(self.ecx().read_discriminant(op)?.1)
+            }
+
             // Recursive actions, ready to be overloaded.
             /// Visits the given value, dispatching as appropriate to more specialized visitors.
             #[inline(always)]
@@ -130,7 +143,7 @@ macro_rules! make_value_visitor {
             }
             /// Visits the given value as a union. No automatic recursion can happen here.
             #[inline(always)]
-            fn visit_union(&mut self, _v: Self::V, _fields: usize) -> InterpResult<'tcx>
+            fn visit_union(&mut self, _v: Self::V, _fields: NonZeroUsize) -> InterpResult<'tcx>
             {
                 Ok(())
             }
@@ -208,6 +221,7 @@ macro_rules! make_value_visitor {
 
                 // Visit the fields of this value.
                 match v.layout().fields {
+                    FieldsShape::Primitive => {},
                     FieldsShape::Union(fields) => {
                         self.visit_union(v, fields)?;
                     },
@@ -240,7 +254,7 @@ macro_rules! make_value_visitor {
                     // with *its* fields.
                     Variants::Multiple { .. } => {
                         let op = v.to_op(self.ecx())?;
-                        let idx = self.ecx().read_discriminant(op)?.1;
+                        let idx = self.read_discriminant(op)?;
                         let inner = v.project_downcast(self.ecx(), idx)?;
                         trace!("walk_value: variant layout: {:#?}", inner.layout());
                         // recurse with the inner type

@@ -5,10 +5,10 @@
 // See https://internals.rust-lang.org/t/rfc-compiler-refactoring-spans/1357/28
 
 use crate::hygiene::SyntaxContext;
-use crate::GLOBALS;
+use crate::SESSION_GLOBALS;
 use crate::{BytePos, SpanData};
 
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::FxIndexSet;
 
 /// A compressed span.
 ///
@@ -111,30 +111,23 @@ impl Span {
 
 #[derive(Default)]
 pub struct SpanInterner {
-    spans: FxHashMap<SpanData, u32>,
-    span_data: Vec<SpanData>,
+    spans: FxIndexSet<SpanData>,
 }
 
 impl SpanInterner {
     fn intern(&mut self, span_data: &SpanData) -> u32 {
-        if let Some(index) = self.spans.get(span_data) {
-            return *index;
-        }
-
-        let index = self.spans.len() as u32;
-        self.span_data.push(*span_data);
-        self.spans.insert(*span_data, index);
-        index
+        let (index, _) = self.spans.insert_full(*span_data);
+        index as u32
     }
 
     #[inline]
     fn get(&self, index: u32) -> &SpanData {
-        &self.span_data[index as usize]
+        &self.spans[index as usize]
     }
 }
 
 // If an interner exists, return it. Otherwise, prepare a fresh one.
 #[inline]
 fn with_span_interner<T, F: FnOnce(&mut SpanInterner) -> T>(f: F) -> T {
-    GLOBALS.with(|globals| f(&mut *globals.span_interner.lock()))
+    SESSION_GLOBALS.with(|session_globals| f(&mut *session_globals.span_interner.lock()))
 }

@@ -2,12 +2,13 @@
 /// Ideally, this code would be in libtest but for efficiency and error messages it lives here.
 use crate::util::check_builtin_macro_attribute;
 
-use rustc_ast::ast;
+use rustc_ast as ast;
 use rustc_ast::attr;
 use rustc_ast_pretty::pprust;
 use rustc_expand::base::*;
+use rustc_session::Session;
 use rustc_span::source_map::respan;
-use rustc_span::symbol::{sym, Symbol};
+use rustc_span::symbol::{sym, Ident, Symbol};
 use rustc_span::Span;
 
 use std::iter;
@@ -87,7 +88,7 @@ pub fn expand_test_or_bench(
     };
 
     if let ast::ItemKind::MacCall(_) = item.kind {
-        cx.parse_sess.span_diagnostic.span_warn(
+        cx.sess.parse_sess.span_diagnostic.span_warn(
             item.span,
             "`#[test]` attribute should not be used on macros. Use `#[cfg(test)]` instead.",
         );
@@ -105,25 +106,41 @@ pub fn expand_test_or_bench(
 
     let (sp, attr_sp) = (cx.with_def_site_ctxt(item.span), cx.with_def_site_ctxt(attr_sp));
 
-    let test_id = ast::Ident::new(sym::test, attr_sp);
+    let test_id = Ident::new(sym::test, attr_sp);
 
     // creates test::$name
-    let test_path = |name| cx.path(sp, vec![test_id, cx.ident_of(name, sp)]);
+    let test_path = |name| cx.path(sp, vec![test_id, Ident::from_str_and_span(name, sp)]);
 
     // creates test::ShouldPanic::$name
-    let should_panic_path =
-        |name| cx.path(sp, vec![test_id, cx.ident_of("ShouldPanic", sp), cx.ident_of(name, sp)]);
+    let should_panic_path = |name| {
+        cx.path(
+            sp,
+            vec![
+                test_id,
+                Ident::from_str_and_span("ShouldPanic", sp),
+                Ident::from_str_and_span(name, sp),
+            ],
+        )
+    };
 
     // creates test::TestType::$name
-    let test_type_path =
-        |name| cx.path(sp, vec![test_id, cx.ident_of("TestType", sp), cx.ident_of(name, sp)]);
+    let test_type_path = |name| {
+        cx.path(
+            sp,
+            vec![
+                test_id,
+                Ident::from_str_and_span("TestType", sp),
+                Ident::from_str_and_span(name, sp),
+            ],
+        )
+    };
 
     // creates $name: $expr
-    let field = |name, expr| cx.field_imm(sp, cx.ident_of(name, sp), expr);
+    let field = |name, expr| cx.field_imm(sp, Ident::from_str_and_span(name, sp), expr);
 
     let test_fn = if is_bench {
         // A simple ident for a lambda
-        let b = cx.ident_of("b", attr_sp);
+        let b = Ident::from_str_and_span("b", attr_sp);
 
         cx.expr_call(
             sp,
@@ -172,12 +189,12 @@ pub fn expand_test_or_bench(
 
     let mut test_const = cx.item(
         sp,
-        ast::Ident::new(item.ident.name, sp),
+        Ident::new(item.ident.name, sp),
         vec![
             // #[cfg(test)]
             cx.attribute(attr::mk_list_item(
-                ast::Ident::new(sym::cfg, attr_sp),
-                vec![attr::mk_nested_word_item(ast::Ident::new(sym::test, attr_sp))],
+                Ident::new(sym::cfg, attr_sp),
+                vec![attr::mk_nested_word_item(Ident::new(sym::test, attr_sp))],
             )),
             // #[rustc_test_marker]
             cx.attribute(cx.meta_word(attr_sp, sym::rustc_test_marker)),
@@ -216,9 +233,15 @@ pub fn expand_test_or_bench(
                                         ),
                                     ),
                                     // ignore: true | false
-                                    field("ignore", cx.expr_bool(sp, should_ignore(&item))),
+                                    field(
+                                        "ignore",
+                                        cx.expr_bool(sp, should_ignore(&cx.sess, &item)),
+                                    ),
                                     // allow_fail: true | false
-                                    field("allow_fail", cx.expr_bool(sp, should_fail(&item))),
+                                    field(
+                                        "allow_fail",
+                                        cx.expr_bool(sp, should_fail(&cx.sess, &item)),
+                                    ),
                                     // should_panic: ...
                                     field(
                                         "should_panic",
@@ -276,7 +299,7 @@ pub fn expand_test_or_bench(
     // extern crate test
     let test_extern = cx.item(sp, test_id, vec![], ast::ItemKind::ExternCrate(None));
 
-    log::debug!("synthetic test item:\n{}\n", pprust::item_to_string(&test_const));
+    tracing::debug!("synthetic test item:\n{}\n", pprust::item_to_string(&test_const));
 
     vec![
         // Access to libtest under a hygienic name
@@ -288,7 +311,7 @@ pub fn expand_test_or_bench(
     ]
 }
 
-fn item_path(mod_path: &[ast::Ident], item_ident: &ast::Ident) -> String {
+fn item_path(mod_path: &[Ident], item_ident: &Ident) -> String {
     mod_path
         .iter()
         .chain(iter::once(item_ident))
@@ -302,25 +325,25 @@ enum ShouldPanic {
     Yes(Option<Symbol>),
 }
 
-fn should_ignore(i: &ast::Item) -> bool {
-    attr::contains_name(&i.attrs, sym::ignore)
+fn should_ignore(sess: &Session, i: &ast::Item) -> bool {
+    sess.contains_name(&i.attrs, sym::ignore)
 }
 
-fn should_fail(i: &ast::Item) -> bool {
-    attr::contains_name(&i.attrs, sym::allow_fail)
+fn should_fail(sess: &Session, i: &ast::Item) -> bool {
+    sess.contains_name(&i.attrs, sym::allow_fail)
 }
 
 fn should_panic(cx: &ExtCtxt<'_>, i: &ast::Item) -> ShouldPanic {
-    match attr::find_by_name(&i.attrs, sym::should_panic) {
+    match cx.sess.find_by_name(&i.attrs, sym::should_panic) {
         Some(attr) => {
-            let sd = &cx.parse_sess.span_diagnostic;
+            let sd = &cx.sess.parse_sess.span_diagnostic;
 
             match attr.meta_item_list() {
                 // Handle #[should_panic(expected = "foo")]
                 Some(list) => {
                     let msg = list
                         .iter()
-                        .find(|mi| mi.check_name(sym::expected))
+                        .find(|mi| mi.has_name(sym::expected))
                         .and_then(|mi| mi.meta_item())
                         .and_then(|mi| mi.value_str());
                     if list.len() != 1 || msg.is_none() {
@@ -377,8 +400,8 @@ fn test_type(cx: &ExtCtxt<'_>) -> TestType {
 }
 
 fn has_test_signature(cx: &ExtCtxt<'_>, i: &ast::Item) -> bool {
-    let has_should_panic_attr = attr::contains_name(&i.attrs, sym::should_panic);
-    let sd = &cx.parse_sess.span_diagnostic;
+    let has_should_panic_attr = cx.sess.contains_name(&i.attrs, sym::should_panic);
+    let sd = &cx.sess.parse_sess.span_diagnostic;
     if let ast::ItemKind::Fn(_, ref sig, ref generics, _) = i.kind {
         if let ast::Unsafe::Yes(span) = sig.header.unsafety {
             sd.struct_span_err(i.span, "unsafe functions cannot be used for tests")
@@ -437,7 +460,7 @@ fn has_bench_signature(cx: &ExtCtxt<'_>, i: &ast::Item) -> bool {
     };
 
     if !has_sig {
-        cx.parse_sess.span_diagnostic.span_err(
+        cx.sess.parse_sess.span_diagnostic.span_err(
             i.span,
             "functions used as benches must have \
             signature `fn(&mut Bencher) -> impl Termination`",

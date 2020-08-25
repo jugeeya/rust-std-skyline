@@ -1,5 +1,6 @@
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/")]
 #![feature(nll)]
+#![feature(or_patterns)]
 #![recursion_limit = "256"]
 
 mod dump_visitor;
@@ -8,14 +9,16 @@ mod dumper;
 mod span_utils;
 mod sig;
 
-use rustc_ast::ast::{self, Attribute, NodeId, PatKind, DUMMY_NODE_ID};
-use rustc_ast::util::comments::strip_doc_comment_decoration;
-use rustc_ast::visit::{self, Visitor};
-use rustc_ast_pretty::pprust::{self, param_to_string, ty_to_string};
+use rustc_ast as ast;
+use rustc_ast::util::comments::beautify_doc_string;
+use rustc_ast_pretty::pprust::attribute_to_string;
 use rustc_hir as hir;
-use rustc_hir::def::{CtorOf, DefKind as HirDefKind, Res};
+use rustc_hir::def::{DefKind as HirDefKind, Res};
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
+use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::Node;
+use rustc_hir_pretty::{enum_def_to_string, fn_to_string, ty_to_string};
+use rustc_middle::hir::map::Map;
 use rustc_middle::middle::cstore::ExternCrate;
 use rustc_middle::middle::privacy::AccessLevels;
 use rustc_middle::ty::{self, DefIdTree, TyCtxt};
@@ -23,6 +26,7 @@ use rustc_middle::{bug, span_bug};
 use rustc_session::config::{CrateType, Input, OutputType};
 use rustc_session::output::{filename_for_metadata, out_filename};
 use rustc_span::source_map::Spanned;
+use rustc_span::symbol::Ident;
 use rustc_span::*;
 
 use std::cell::Cell;
@@ -41,15 +45,12 @@ use rls_data::{
     RefKind, Relation, RelationKind, SpanData,
 };
 
-use log::{debug, error, info};
+use tracing::{debug, error, info};
 
-pub struct SaveContext<'l, 'tcx> {
+pub struct SaveContext<'tcx> {
     tcx: TyCtxt<'tcx>,
-    tables: &'l ty::TypeckTables<'tcx>,
-    /// Used as a fallback when nesting the typeck tables during item processing
-    /// (if these are not available for that item, e.g. don't own a body)
-    empty_tables: &'l ty::TypeckTables<'tcx>,
-    access_levels: &'l AccessLevels,
+    maybe_typeck_results: Option<&'tcx ty::TypeckResults<'tcx>>,
+    access_levels: &'tcx AccessLevels,
     span_utils: SpanUtils<'tcx>,
     config: Config,
     impl_counter: Cell<u32>,
@@ -62,7 +63,15 @@ pub enum Data {
     RelationData(Relation, Impl),
 }
 
-impl<'l, 'tcx> SaveContext<'l, 'tcx> {
+impl<'tcx> SaveContext<'tcx> {
+    /// Gets the type-checking results for the current body.
+    /// As this will ICE if called outside bodies, only call when working with
+    /// `Expr` or `Pat` nodes (they are guaranteed to be found only in bodies).
+    #[track_caller]
+    fn typeck_results(&self) -> &'tcx ty::TypeckResults<'tcx> {
+        self.maybe_typeck_results.expect("`SaveContext::typeck_results` called outside of body")
+    }
+
     fn span_from_span(&self, span: Span) -> SpanData {
         use rls_span::{Column, Row};
 
@@ -85,7 +94,7 @@ impl<'l, 'tcx> SaveContext<'l, 'tcx> {
     pub fn compilation_output(&self, crate_name: &str) -> PathBuf {
         let sess = &self.tcx.sess;
         // Save-analysis is emitted per whole session, not per each crate type
-        let crate_type = sess.crate_types.borrow()[0];
+        let crate_type = sess.crate_types()[0];
         let outputs = &*self.tcx.output_filenames(LOCAL_CRATE);
 
         if outputs.outputs.contains_key(&OutputType::Metadata) {
@@ -127,34 +136,48 @@ impl<'l, 'tcx> SaveContext<'l, 'tcx> {
         result
     }
 
-    pub fn get_extern_item_data(&self, item: &ast::ForeignItem) -> Option<Data> {
-        let qualname = format!(
-            "::{}",
-            self.tcx.def_path_str(self.tcx.hir().local_def_id_from_node_id(item.id))
-        );
+    pub fn get_extern_item_data(&self, item: &hir::ForeignItem<'_>) -> Option<Data> {
+        let def_id = self.tcx.hir().local_def_id(item.hir_id).to_def_id();
+        let qualname = format!("::{}", self.tcx.def_path_str(def_id));
         match item.kind {
-            ast::ForeignItemKind::Fn(_, ref sig, ref generics, _) => {
+            hir::ForeignItemKind::Fn(ref decl, arg_names, ref generics) => {
                 filter!(self.span_utils, item.ident.span);
 
                 Some(Data::DefData(Def {
                     kind: DefKind::ForeignFunction,
-                    id: id_from_node_id(item.id, self),
+                    id: id_from_def_id(def_id),
                     span: self.span_from_span(item.ident.span),
                     name: item.ident.to_string(),
                     qualname,
-                    value: make_signature(&sig.decl, generics),
+                    value: fn_to_string(
+                        decl,
+                        hir::FnHeader {
+                            // functions in extern block are implicitly unsafe
+                            unsafety: hir::Unsafety::Unsafe,
+                            // functions in extern block cannot be const
+                            constness: hir::Constness::NotConst,
+                            abi: self.tcx.hir().get_foreign_abi(item.hir_id),
+                            // functions in extern block cannot be async
+                            asyncness: hir::IsAsync::NotAsync,
+                        },
+                        Some(item.ident.name),
+                        generics,
+                        &item.vis,
+                        arg_names,
+                        None,
+                    ),
                     parent: None,
                     children: vec![],
                     decl_id: None,
                     docs: self.docs_for_attrs(&item.attrs),
                     sig: sig::foreign_item_signature(item, self),
-                    attributes: lower_attributes(item.attrs.clone(), self),
+                    attributes: lower_attributes(item.attrs.to_vec(), self),
                 }))
             }
-            ast::ForeignItemKind::Static(ref ty, _, _) => {
+            hir::ForeignItemKind::Static(ref ty, _) => {
                 filter!(self.span_utils, item.ident.span);
 
-                let id = id_from_node_id(item.id, self);
+                let id = id_from_def_id(def_id);
                 let span = self.span_from_span(item.ident.span);
 
                 Some(Data::DefData(Def {
@@ -169,47 +192,49 @@ impl<'l, 'tcx> SaveContext<'l, 'tcx> {
                     decl_id: None,
                     docs: self.docs_for_attrs(&item.attrs),
                     sig: sig::foreign_item_signature(item, self),
-                    attributes: lower_attributes(item.attrs.clone(), self),
+                    attributes: lower_attributes(item.attrs.to_vec(), self),
                 }))
             }
             // FIXME(plietar): needs a new DefKind in rls-data
-            ast::ForeignItemKind::TyAlias(..) => None,
-            ast::ForeignItemKind::MacCall(..) => None,
+            hir::ForeignItemKind::Type => None,
         }
     }
 
-    pub fn get_item_data(&self, item: &ast::Item) -> Option<Data> {
+    pub fn get_item_data(&self, item: &hir::Item<'_>) -> Option<Data> {
+        let def_id = self.tcx.hir().local_def_id(item.hir_id).to_def_id();
         match item.kind {
-            ast::ItemKind::Fn(_, ref sig, .., ref generics, _) => {
-                let qualname = format!(
-                    "::{}",
-                    self.tcx.def_path_str(self.tcx.hir().local_def_id_from_node_id(item.id))
-                );
+            hir::ItemKind::Fn(ref sig, ref generics, _) => {
+                let qualname = format!("::{}", self.tcx.def_path_str(def_id));
                 filter!(self.span_utils, item.ident.span);
                 Some(Data::DefData(Def {
                     kind: DefKind::Function,
-                    id: id_from_node_id(item.id, self),
+                    id: id_from_def_id(def_id),
                     span: self.span_from_span(item.ident.span),
                     name: item.ident.to_string(),
                     qualname,
-                    value: make_signature(&sig.decl, generics),
+                    value: fn_to_string(
+                        sig.decl,
+                        sig.header,
+                        Some(item.ident.name),
+                        generics,
+                        &item.vis,
+                        &[],
+                        None,
+                    ),
                     parent: None,
                     children: vec![],
                     decl_id: None,
                     docs: self.docs_for_attrs(&item.attrs),
                     sig: sig::item_signature(item, self),
-                    attributes: lower_attributes(item.attrs.clone(), self),
+                    attributes: lower_attributes(item.attrs.to_vec(), self),
                 }))
             }
-            ast::ItemKind::Static(ref typ, ..) => {
-                let qualname = format!(
-                    "::{}",
-                    self.tcx.def_path_str(self.tcx.hir().local_def_id_from_node_id(item.id))
-                );
+            hir::ItemKind::Static(ref typ, ..) => {
+                let qualname = format!("::{}", self.tcx.def_path_str(def_id));
 
                 filter!(self.span_utils, item.ident.span);
 
-                let id = id_from_node_id(item.id, self);
+                let id = id_from_def_id(def_id);
                 let span = self.span_from_span(item.ident.span);
 
                 Some(Data::DefData(Def {
@@ -224,17 +249,14 @@ impl<'l, 'tcx> SaveContext<'l, 'tcx> {
                     decl_id: None,
                     docs: self.docs_for_attrs(&item.attrs),
                     sig: sig::item_signature(item, self),
-                    attributes: lower_attributes(item.attrs.clone(), self),
+                    attributes: lower_attributes(item.attrs.to_vec(), self),
                 }))
             }
-            ast::ItemKind::Const(_, ref typ, _) => {
-                let qualname = format!(
-                    "::{}",
-                    self.tcx.def_path_str(self.tcx.hir().local_def_id_from_node_id(item.id))
-                );
+            hir::ItemKind::Const(ref typ, _) => {
+                let qualname = format!("::{}", self.tcx.def_path_str(def_id));
                 filter!(self.span_utils, item.ident.span);
 
-                let id = id_from_node_id(item.id, self);
+                let id = id_from_def_id(def_id);
                 let span = self.span_from_span(item.ident.span);
 
                 Some(Data::DefData(Def {
@@ -249,14 +271,11 @@ impl<'l, 'tcx> SaveContext<'l, 'tcx> {
                     decl_id: None,
                     docs: self.docs_for_attrs(&item.attrs),
                     sig: sig::item_signature(item, self),
-                    attributes: lower_attributes(item.attrs.clone(), self),
+                    attributes: lower_attributes(item.attrs.to_vec(), self),
                 }))
             }
-            ast::ItemKind::Mod(ref m) => {
-                let qualname = format!(
-                    "::{}",
-                    self.tcx.def_path_str(self.tcx.hir().local_def_id_from_node_id(item.id))
-                );
+            hir::ItemKind::Mod(ref m) => {
+                let qualname = format!("::{}", self.tcx.def_path_str(def_id));
 
                 let sm = self.tcx.sess.source_map();
                 let filename = sm.span_to_filename(m.inner);
@@ -265,46 +284,42 @@ impl<'l, 'tcx> SaveContext<'l, 'tcx> {
 
                 Some(Data::DefData(Def {
                     kind: DefKind::Mod,
-                    id: id_from_node_id(item.id, self),
+                    id: id_from_def_id(def_id),
                     name: item.ident.to_string(),
                     qualname,
                     span: self.span_from_span(item.ident.span),
                     value: filename.to_string(),
                     parent: None,
-                    children: m.items.iter().map(|i| id_from_node_id(i.id, self)).collect(),
+                    children: m.item_ids.iter().map(|i| id_from_hir_id(i.id, self)).collect(),
                     decl_id: None,
                     docs: self.docs_for_attrs(&item.attrs),
                     sig: sig::item_signature(item, self),
-                    attributes: lower_attributes(item.attrs.clone(), self),
+                    attributes: lower_attributes(item.attrs.to_vec(), self),
                 }))
             }
-            ast::ItemKind::Enum(ref def, _) => {
+            hir::ItemKind::Enum(ref def, ref generics) => {
                 let name = item.ident.to_string();
-                let qualname = format!(
-                    "::{}",
-                    self.tcx.def_path_str(self.tcx.hir().local_def_id_from_node_id(item.id))
-                );
+                let qualname = format!("::{}", self.tcx.def_path_str(def_id));
                 filter!(self.span_utils, item.ident.span);
-                let variants_str =
-                    def.variants.iter().map(|v| v.ident.to_string()).collect::<Vec<_>>().join(", ");
-                let value = format!("{}::{{{}}}", name, variants_str);
+                let value =
+                    enum_def_to_string(def, generics, item.ident.name, item.span, &item.vis);
                 Some(Data::DefData(Def {
                     kind: DefKind::Enum,
-                    id: id_from_node_id(item.id, self),
+                    id: id_from_def_id(def_id),
                     span: self.span_from_span(item.ident.span),
                     name,
                     qualname,
                     value,
                     parent: None,
-                    children: def.variants.iter().map(|v| id_from_node_id(v.id, self)).collect(),
+                    children: def.variants.iter().map(|v| id_from_hir_id(v.id, self)).collect(),
                     decl_id: None,
                     docs: self.docs_for_attrs(&item.attrs),
                     sig: sig::item_signature(item, self),
-                    attributes: lower_attributes(item.attrs.clone(), self),
+                    attributes: lower_attributes(item.attrs.to_vec(), self),
                 }))
             }
-            ast::ItemKind::Impl { ref of_trait, ref self_ty, ref items, .. } => {
-                if let ast::TyKind::Path(None, ref path) = self_ty.kind {
+            hir::ItemKind::Impl { ref of_trait, ref self_ty, ref items, .. } => {
+                if let hir::TyKind::Path(hir::QPath::Resolved(_, ref path)) = self_ty.kind {
                     // Common case impl for a struct or something basic.
                     if generated_code(path.span) {
                         return None;
@@ -315,7 +330,7 @@ impl<'l, 'tcx> SaveContext<'l, 'tcx> {
                     let impl_id = self.next_impl_id();
                     let span = self.span_from_span(sub_span);
 
-                    let type_data = self.lookup_def_id(self_ty.id);
+                    let type_data = self.lookup_def_id(self_ty.hir_id);
                     type_data.map(|type_data| {
                         Data::RelationData(
                             Relation {
@@ -324,7 +339,7 @@ impl<'l, 'tcx> SaveContext<'l, 'tcx> {
                                 from: id_from_def_id(type_data),
                                 to: of_trait
                                     .as_ref()
-                                    .and_then(|t| self.lookup_def_id(t.ref_id))
+                                    .and_then(|t| self.lookup_def_id(t.hir_ref_id))
                                     .map(id_from_def_id)
                                     .unwrap_or_else(null_id),
                             },
@@ -339,7 +354,7 @@ impl<'l, 'tcx> SaveContext<'l, 'tcx> {
                                 parent: None,
                                 children: items
                                     .iter()
-                                    .map(|i| id_from_node_id(i.id, self))
+                                    .map(|i| id_from_hir_id(i.id.hir_id, self))
                                     .collect(),
                                 docs: String::new(),
                                 sig: None,
@@ -358,123 +373,120 @@ impl<'l, 'tcx> SaveContext<'l, 'tcx> {
         }
     }
 
-    pub fn get_field_data(&self, field: &ast::StructField, scope: NodeId) -> Option<Def> {
-        if let Some(ident) = field.ident {
-            let name = ident.to_string();
-            let qualname = format!(
-                "::{}::{}",
-                self.tcx.def_path_str(self.tcx.hir().local_def_id_from_node_id(scope)),
-                ident
-            );
-            filter!(self.span_utils, ident.span);
-            let def_id = self.tcx.hir().local_def_id_from_node_id(field.id);
-            let typ = self.tcx.type_of(def_id).to_string();
+    pub fn get_field_data(&self, field: &hir::StructField<'_>, scope: hir::HirId) -> Option<Def> {
+        let name = field.ident.to_string();
+        let scope_def_id = self.tcx.hir().local_def_id(scope).to_def_id();
+        let qualname = format!("::{}::{}", self.tcx.def_path_str(scope_def_id), field.ident);
+        filter!(self.span_utils, field.ident.span);
+        let field_def_id = self.tcx.hir().local_def_id(field.hir_id).to_def_id();
+        let typ = self.tcx.type_of(field_def_id).to_string();
 
-            let id = id_from_node_id(field.id, self);
-            let span = self.span_from_span(ident.span);
+        let id = id_from_def_id(field_def_id);
+        let span = self.span_from_span(field.ident.span);
 
-            Some(Def {
-                kind: DefKind::Field,
-                id,
-                span,
-                name,
-                qualname,
-                value: typ,
-                parent: Some(id_from_node_id(scope, self)),
-                children: vec![],
-                decl_id: None,
-                docs: self.docs_for_attrs(&field.attrs),
-                sig: sig::field_signature(field, self),
-                attributes: lower_attributes(field.attrs.clone(), self),
-            })
-        } else {
-            None
-        }
+        Some(Def {
+            kind: DefKind::Field,
+            id,
+            span,
+            name,
+            qualname,
+            value: typ,
+            parent: Some(id_from_def_id(scope_def_id)),
+            children: vec![],
+            decl_id: None,
+            docs: self.docs_for_attrs(&field.attrs),
+            sig: sig::field_signature(field, self),
+            attributes: lower_attributes(field.attrs.to_vec(), self),
+        })
     }
 
     // FIXME would be nice to take a MethodItem here, but the ast provides both
     // trait and impl flavours, so the caller must do the disassembly.
-    pub fn get_method_data(&self, id: ast::NodeId, ident: ast::Ident, span: Span) -> Option<Def> {
+    pub fn get_method_data(&self, hir_id: hir::HirId, ident: Ident, span: Span) -> Option<Def> {
         // The qualname for a method is the trait name or name of the struct in an impl in
         // which the method is declared in, followed by the method's name.
-        let (qualname, parent_scope, decl_id, docs, attributes) = match self
-            .tcx
-            .impl_of_method(self.tcx.hir().local_def_id_from_node_id(id))
-        {
-            Some(impl_id) => match self.tcx.hir().get_if_local(impl_id) {
-                Some(Node::Item(item)) => match item.kind {
-                    hir::ItemKind::Impl { ref self_ty, .. } => {
-                        let hir = self.tcx.hir();
+        let def_id = self.tcx.hir().local_def_id(hir_id).to_def_id();
+        let (qualname, parent_scope, decl_id, docs, attributes) =
+            match self.tcx.impl_of_method(def_id) {
+                Some(impl_id) => match self.tcx.hir().get_if_local(impl_id) {
+                    Some(Node::Item(item)) => match item.kind {
+                        hir::ItemKind::Impl { ref self_ty, .. } => {
+                            let hir = self.tcx.hir();
 
-                        let mut qualname = String::from("<");
-                        qualname.push_str(&rustc_hir_pretty::id_to_string(&hir, self_ty.hir_id));
+                            let mut qualname = String::from("<");
+                            qualname
+                                .push_str(&rustc_hir_pretty::id_to_string(&hir, self_ty.hir_id));
 
-                        let trait_id = self.tcx.trait_id_of_impl(impl_id);
+                            let trait_id = self.tcx.trait_id_of_impl(impl_id);
+                            let mut docs = String::new();
+                            let mut attrs = vec![];
+                            if let Some(Node::ImplItem(item)) = hir.find(hir_id) {
+                                docs = self.docs_for_attrs(&item.attrs);
+                                attrs = item.attrs.to_vec();
+                            }
+
+                            let mut decl_id = None;
+                            if let Some(def_id) = trait_id {
+                                // A method in a trait impl.
+                                qualname.push_str(" as ");
+                                qualname.push_str(&self.tcx.def_path_str(def_id));
+
+                                decl_id = self
+                                    .tcx
+                                    .associated_items(def_id)
+                                    .filter_by_name_unhygienic(ident.name)
+                                    .next()
+                                    .map(|item| item.def_id);
+                            }
+                            qualname.push_str(">");
+
+                            (qualname, trait_id, decl_id, docs, attrs)
+                        }
+                        _ => {
+                            span_bug!(
+                                span,
+                                "Container {:?} for method {} not an impl?",
+                                impl_id,
+                                hir_id
+                            );
+                        }
+                    },
+                    r => {
+                        span_bug!(
+                            span,
+                            "Container {:?} for method {} is not a node item {:?}",
+                            impl_id,
+                            hir_id,
+                            r
+                        );
+                    }
+                },
+                None => match self.tcx.trait_of_item(def_id) {
+                    Some(def_id) => {
                         let mut docs = String::new();
                         let mut attrs = vec![];
-                        if let Some(Node::ImplItem(item)) = hir.find(hir.node_id_to_hir_id(id)) {
+
+                        if let Some(Node::TraitItem(item)) = self.tcx.hir().find(hir_id) {
                             docs = self.docs_for_attrs(&item.attrs);
                             attrs = item.attrs.to_vec();
                         }
 
-                        let mut decl_id = None;
-                        if let Some(def_id) = trait_id {
-                            // A method in a trait impl.
-                            qualname.push_str(" as ");
-                            qualname.push_str(&self.tcx.def_path_str(def_id));
-
-                            decl_id = self
-                                .tcx
-                                .associated_items(def_id)
-                                .filter_by_name_unhygienic(ident.name)
-                                .next()
-                                .map(|item| item.def_id);
-                        }
-                        qualname.push_str(">");
-
-                        (qualname, trait_id, decl_id, docs, attrs)
+                        (
+                            format!("::{}", self.tcx.def_path_str(def_id)),
+                            Some(def_id),
+                            None,
+                            docs,
+                            attrs,
+                        )
                     }
-                    _ => {
-                        span_bug!(span, "Container {:?} for method {} not an impl?", impl_id, id);
+                    None => {
+                        debug!("could not find container for method {} at {:?}", hir_id, span);
+                        // This is not necessarily a bug, if there was a compilation error,
+                        // the typeck results we need might not exist.
+                        return None;
                     }
                 },
-                r => {
-                    span_bug!(
-                        span,
-                        "Container {:?} for method {} is not a node item {:?}",
-                        impl_id,
-                        id,
-                        r
-                    );
-                }
-            },
-            None => match self.tcx.trait_of_item(self.tcx.hir().local_def_id_from_node_id(id)) {
-                Some(def_id) => {
-                    let mut docs = String::new();
-                    let mut attrs = vec![];
-                    let hir_id = self.tcx.hir().node_id_to_hir_id(id);
-
-                    if let Some(Node::TraitItem(item)) = self.tcx.hir().find(hir_id) {
-                        docs = self.docs_for_attrs(&item.attrs);
-                        attrs = item.attrs.to_vec();
-                    }
-
-                    (
-                        format!("::{}", self.tcx.def_path_str(def_id)),
-                        Some(def_id),
-                        None,
-                        docs,
-                        attrs,
-                    )
-                }
-                None => {
-                    debug!("could not find container for method {} at {:?}", id, span);
-                    // This is not necessarily a bug, if there was a compilation error,
-                    // the tables we need might not exist.
-                    return None;
-                }
-            },
-        };
+            };
 
         let qualname = format!("{}::{}", qualname, ident.name);
 
@@ -482,7 +494,7 @@ impl<'l, 'tcx> SaveContext<'l, 'tcx> {
 
         Some(Def {
             kind: DefKind::Method,
-            id: id_from_node_id(id, self),
+            id: id_from_def_id(def_id),
             span: self.span_from_span(ident.span),
             name: ident.name.to_string(),
             qualname,
@@ -497,8 +509,8 @@ impl<'l, 'tcx> SaveContext<'l, 'tcx> {
         })
     }
 
-    pub fn get_trait_ref_data(&self, trait_ref: &ast::TraitRef) -> Option<Ref> {
-        self.lookup_def_id(trait_ref.ref_id).and_then(|def_id| {
+    pub fn get_trait_ref_data(&self, trait_ref: &hir::TraitRef<'_>) -> Option<Ref> {
+        self.lookup_def_id(trait_ref.hir_ref_id).and_then(|def_id| {
             let span = trait_ref.path.span;
             if generated_code(span) {
                 return None;
@@ -510,27 +522,14 @@ impl<'l, 'tcx> SaveContext<'l, 'tcx> {
         })
     }
 
-    pub fn get_expr_data(&self, expr: &ast::Expr) -> Option<Data> {
-        let expr_hir_id = self.tcx.hir().node_id_to_hir_id(expr.id);
-        let hir_node = self.tcx.hir().expect_expr(expr_hir_id);
-        let ty = self.tables.expr_ty_adjusted_opt(&hir_node);
-        if ty.is_none() || ty.unwrap().kind == ty::Error {
+    pub fn get_expr_data(&self, expr: &hir::Expr<'_>) -> Option<Data> {
+        let ty = self.typeck_results().expr_ty_adjusted_opt(expr)?;
+        if matches!(ty.kind, ty::Error(_)) {
             return None;
         }
         match expr.kind {
-            ast::ExprKind::Field(ref sub_ex, ident) => {
-                let sub_ex_hir_id = self.tcx.hir().node_id_to_hir_id(sub_ex.id);
-                let hir_node = match self.tcx.hir().find(sub_ex_hir_id) {
-                    Some(Node::Expr(expr)) => expr,
-                    _ => {
-                        debug!(
-                            "Missing or weird node for sub-expression {} in {:?}",
-                            sub_ex.id, expr
-                        );
-                        return None;
-                    }
-                };
-                match self.tables.expr_ty_adjusted(&hir_node).kind {
+            hir::ExprKind::Field(ref sub_ex, ident) => {
+                match self.typeck_results().expr_ty_adjusted(&sub_ex).kind {
                     ty::Adt(def, _) if !def.is_enum() => {
                         let variant = &def.non_enum_variant();
                         filter!(self.span_utils, ident.span);
@@ -552,29 +551,24 @@ impl<'l, 'tcx> SaveContext<'l, 'tcx> {
                     }
                 }
             }
-            ast::ExprKind::Struct(ref path, ..) => {
-                match self.tables.expr_ty_adjusted(&hir_node).kind {
-                    ty::Adt(def, _) if !def.is_enum() => {
-                        let sub_span = path.segments.last().unwrap().ident.span;
-                        filter!(self.span_utils, sub_span);
-                        let span = self.span_from_span(sub_span);
-                        Some(Data::RefData(Ref {
-                            kind: RefKind::Type,
-                            span,
-                            ref_id: id_from_def_id(def.did),
-                        }))
-                    }
-                    _ => {
-                        // FIXME ty could legitimately be an enum, but then we will fail
-                        // later if we try to look up the fields.
-                        debug!("expected struct or union, found {:?}", ty);
-                        None
-                    }
+            hir::ExprKind::Struct(qpath, ..) => match ty.kind {
+                ty::Adt(def, _) => {
+                    let sub_span = qpath.last_segment_span();
+                    filter!(self.span_utils, sub_span);
+                    let span = self.span_from_span(sub_span);
+                    Some(Data::RefData(Ref {
+                        kind: RefKind::Type,
+                        span,
+                        ref_id: id_from_def_id(def.did),
+                    }))
                 }
-            }
-            ast::ExprKind::MethodCall(ref seg, ..) => {
-                let expr_hir_id = self.tcx.hir().definitions().node_id_to_hir_id(expr.id);
-                let method_id = match self.tables.type_dependent_def_id(expr_hir_id) {
+                _ => {
+                    debug!("expected adt, found {:?}", ty);
+                    None
+                }
+            },
+            hir::ExprKind::MethodCall(ref seg, ..) => {
+                let method_id = match self.typeck_results().type_dependent_def_id(expr.hir_id) {
                     Some(id) => id,
                     None => {
                         debug!("could not resolve method id for {:?}", expr);
@@ -594,18 +588,17 @@ impl<'l, 'tcx> SaveContext<'l, 'tcx> {
                     ref_id: def_id.or(decl_id).map(id_from_def_id).unwrap_or_else(null_id),
                 }))
             }
-            ast::ExprKind::Path(_, ref path) => {
-                self.get_path_data(expr.id, path).map(Data::RefData)
+            hir::ExprKind::Path(ref path) => {
+                self.get_path_data(expr.hir_id, path).map(Data::RefData)
             }
             _ => {
                 // FIXME
-                bug!();
+                bug!("invalid expression: {:?}", expr);
             }
         }
     }
 
-    pub fn get_path_res(&self, id: NodeId) -> Res {
-        let hir_id = self.tcx.hir().node_id_to_hir_id(id);
+    pub fn get_path_res(&self, hir_id: hir::HirId) -> Res {
         match self.tcx.hir().get(hir_id) {
             Node::TraitRef(tr) => tr.path.res,
 
@@ -619,21 +612,28 @@ impl<'l, 'tcx> SaveContext<'l, 'tcx> {
                 Some(res) if res != Res::Err => res,
                 _ => {
                     let parent_node = self.tcx.hir().get_parent_node(hir_id);
-                    self.get_path_res(self.tcx.hir().hir_id_to_node_id(parent_node))
+                    self.get_path_res(parent_node)
                 }
             },
 
             Node::Expr(&hir::Expr { kind: hir::ExprKind::Struct(ref qpath, ..), .. }) => {
-                self.tables.qpath_res(qpath, hir_id)
+                self.typeck_results().qpath_res(qpath, hir_id)
             }
 
             Node::Expr(&hir::Expr { kind: hir::ExprKind::Path(ref qpath), .. })
-            | Node::Pat(&hir::Pat { kind: hir::PatKind::Path(ref qpath), .. })
-            | Node::Pat(&hir::Pat { kind: hir::PatKind::Struct(ref qpath, ..), .. })
-            | Node::Pat(&hir::Pat { kind: hir::PatKind::TupleStruct(ref qpath, ..), .. })
-            | Node::Ty(&hir::Ty { kind: hir::TyKind::Path(ref qpath), .. }) => {
-                self.tables.qpath_res(qpath, hir_id)
-            }
+            | Node::Pat(&hir::Pat {
+                kind:
+                    hir::PatKind::Path(ref qpath)
+                    | hir::PatKind::Struct(ref qpath, ..)
+                    | hir::PatKind::TupleStruct(ref qpath, ..),
+                ..
+            })
+            | Node::Ty(&hir::Ty { kind: hir::TyKind::Path(ref qpath), .. }) => match qpath {
+                hir::QPath::Resolved(_, path) => path.res,
+                hir::QPath::TypeRelative(..) | hir::QPath::LangItem(..) => self
+                    .maybe_typeck_results
+                    .map_or(Res::Err, |typeck_results| typeck_results.qpath_res(qpath, hir_id)),
+            },
 
             Node::Binding(&hir::Pat {
                 kind: hir::PatKind::Binding(_, canonical_id, ..), ..
@@ -643,33 +643,29 @@ impl<'l, 'tcx> SaveContext<'l, 'tcx> {
         }
     }
 
-    pub fn get_path_data(&self, id: NodeId, path: &ast::Path) -> Option<Ref> {
-        path.segments.last().and_then(|seg| {
+    pub fn get_path_data(&self, id: hir::HirId, path: &hir::QPath<'_>) -> Option<Ref> {
+        let segment = match path {
+            hir::QPath::Resolved(_, path) => path.segments.last(),
+            hir::QPath::TypeRelative(_, segment) => Some(*segment),
+            hir::QPath::LangItem(..) => None,
+        };
+        segment.and_then(|seg| {
             self.get_path_segment_data(seg).or_else(|| self.get_path_segment_data_with_id(seg, id))
         })
     }
 
-    pub fn get_path_segment_data(&self, path_seg: &ast::PathSegment) -> Option<Ref> {
-        self.get_path_segment_data_with_id(path_seg, path_seg.id)
+    pub fn get_path_segment_data(&self, path_seg: &hir::PathSegment<'_>) -> Option<Ref> {
+        self.get_path_segment_data_with_id(path_seg, path_seg.hir_id?)
     }
 
-    fn get_path_segment_data_with_id(
+    pub fn get_path_segment_data_with_id(
         &self,
-        path_seg: &ast::PathSegment,
-        id: NodeId,
+        path_seg: &hir::PathSegment<'_>,
+        id: hir::HirId,
     ) -> Option<Ref> {
         // Returns true if the path is function type sugar, e.g., `Fn(A) -> B`.
-        fn fn_type(seg: &ast::PathSegment) -> bool {
-            if let Some(ref generic_args) = seg.args {
-                if let ast::GenericArgs::Parenthesized(_) = **generic_args {
-                    return true;
-                }
-            }
-            false
-        }
-
-        if id == DUMMY_NODE_ID {
-            return None;
+        fn fn_type(seg: &hir::PathSegment<'_>) -> bool {
+            seg.args.map(|args| args.parenthesized).unwrap_or(false)
         }
 
         let res = self.get_path_res(id);
@@ -678,42 +674,37 @@ impl<'l, 'tcx> SaveContext<'l, 'tcx> {
         let span = self.span_from_span(span);
 
         match res {
-            Res::Local(id) => Some(Ref {
-                kind: RefKind::Variable,
-                span,
-                ref_id: id_from_node_id(self.tcx.hir().hir_id_to_node_id(id), self),
-            }),
+            Res::Local(id) => {
+                Some(Ref { kind: RefKind::Variable, span, ref_id: id_from_hir_id(id, self) })
+            }
             Res::Def(HirDefKind::Trait, def_id) if fn_type(path_seg) => {
                 Some(Ref { kind: RefKind::Type, span, ref_id: id_from_def_id(def_id) })
             }
-            Res::Def(HirDefKind::Struct, def_id)
-            | Res::Def(HirDefKind::Variant, def_id)
-            | Res::Def(HirDefKind::Union, def_id)
-            | Res::Def(HirDefKind::Enum, def_id)
-            | Res::Def(HirDefKind::TyAlias, def_id)
-            | Res::Def(HirDefKind::ForeignTy, def_id)
-            | Res::Def(HirDefKind::TraitAlias, def_id)
-            | Res::Def(HirDefKind::AssocOpaqueTy, def_id)
-            | Res::Def(HirDefKind::AssocTy, def_id)
-            | Res::Def(HirDefKind::Trait, def_id)
-            | Res::Def(HirDefKind::OpaqueTy, def_id)
-            | Res::Def(HirDefKind::TyParam, def_id) => {
-                Some(Ref { kind: RefKind::Type, span, ref_id: id_from_def_id(def_id) })
-            }
+            Res::Def(
+                HirDefKind::Struct
+                | HirDefKind::Variant
+                | HirDefKind::Union
+                | HirDefKind::Enum
+                | HirDefKind::TyAlias
+                | HirDefKind::ForeignTy
+                | HirDefKind::TraitAlias
+                | HirDefKind::AssocTy
+                | HirDefKind::Trait
+                | HirDefKind::OpaqueTy
+                | HirDefKind::TyParam,
+                def_id,
+            ) => Some(Ref { kind: RefKind::Type, span, ref_id: id_from_def_id(def_id) }),
             Res::Def(HirDefKind::ConstParam, def_id) => {
                 Some(Ref { kind: RefKind::Variable, span, ref_id: id_from_def_id(def_id) })
             }
-            Res::Def(HirDefKind::Ctor(CtorOf::Struct, ..), def_id) => {
-                // This is a reference to a tuple struct where the def_id points
+            Res::Def(HirDefKind::Ctor(..), def_id) => {
+                // This is a reference to a tuple struct or an enum variant where the def_id points
                 // to an invisible constructor function. That is not a very useful
-                // def, so adjust to point to the tuple struct itself.
+                // def, so adjust to point to the tuple struct or enum variant itself.
                 let parent_def_id = self.tcx.parent(def_id).unwrap();
                 Some(Ref { kind: RefKind::Type, span, ref_id: id_from_def_id(parent_def_id) })
             }
-            Res::Def(HirDefKind::Static, _)
-            | Res::Def(HirDefKind::Const, _)
-            | Res::Def(HirDefKind::AssocConst, _)
-            | Res::Def(HirDefKind::Ctor(..), _) => {
+            Res::Def(HirDefKind::Static | HirDefKind::Const | HirDefKind::AssocConst, _) => {
                 Some(Ref { kind: RefKind::Variable, span, ref_id: id_from_def_id(res.def_id()) })
             }
             Res::Def(HirDefKind::AssocFn, decl_id) => {
@@ -740,9 +731,23 @@ impl<'l, 'tcx> SaveContext<'l, 'tcx> {
             Res::Def(HirDefKind::Mod, def_id) => {
                 Some(Ref { kind: RefKind::Mod, span, ref_id: id_from_def_id(def_id) })
             }
-            Res::PrimTy(..)
+
+            Res::Def(
+                HirDefKind::Macro(..)
+                | HirDefKind::ExternCrate
+                | HirDefKind::ForeignMod
+                | HirDefKind::LifetimeParam
+                | HirDefKind::AnonConst
+                | HirDefKind::Use
+                | HirDefKind::Field
+                | HirDefKind::GlobalAsm
+                | HirDefKind::Impl
+                | HirDefKind::Closure
+                | HirDefKind::Generator,
+                _,
+            )
+            | Res::PrimTy(..)
             | Res::SelfTy(..)
-            | Res::Def(HirDefKind::Macro(..), _)
             | Res::ToolMod
             | Res::NonMacroAttr(..)
             | Res::SelfCtor(..)
@@ -752,7 +757,7 @@ impl<'l, 'tcx> SaveContext<'l, 'tcx> {
 
     pub fn get_field_ref_data(
         &self,
-        field_ref: &ast::Field,
+        field_ref: &hir::Field<'_>,
         variant: &ty::VariantDef,
     ) -> Option<Ref> {
         filter!(self.span_utils, field_ref.ident.span);
@@ -779,7 +784,7 @@ impl<'l, 'tcx> SaveContext<'l, 'tcx> {
         let callee = span.source_callee()?;
 
         let mac_name = match callee.kind {
-            ExpnKind::Macro(mac_kind, name) => match mac_kind {
+            ExpnKind::Macro(kind, name) => match kind {
                 MacroKind::Bang => name,
 
                 // Ignore attribute macros, their spans are usually mangled
@@ -800,32 +805,29 @@ impl<'l, 'tcx> SaveContext<'l, 'tcx> {
         })
     }
 
-    fn lookup_def_id(&self, ref_id: NodeId) -> Option<DefId> {
+    fn lookup_def_id(&self, ref_id: hir::HirId) -> Option<DefId> {
         match self.get_path_res(ref_id) {
             Res::PrimTy(_) | Res::SelfTy(..) | Res::Err => None,
             def => def.opt_def_id(),
         }
     }
 
-    fn docs_for_attrs(&self, attrs: &[Attribute]) -> String {
+    fn docs_for_attrs(&self, attrs: &[ast::Attribute]) -> String {
         let mut result = String::new();
 
         for attr in attrs {
             if let Some(val) = attr.doc_str() {
-                if attr.is_doc_comment() {
-                    result.push_str(&strip_doc_comment_decoration(&val.as_str()));
-                } else {
-                    result.push_str(&val.as_str());
-                }
+                // FIXME: Should save-analysis beautify doc strings itself or leave it to users?
+                result.push_str(&beautify_doc_string(val));
                 result.push('\n');
-            } else if attr.check_name(sym::doc) {
+            } else if self.tcx.sess.check_name(attr, sym::doc) {
                 if let Some(meta_list) = attr.meta_item_list() {
                     meta_list
                         .into_iter()
-                        .filter(|it| it.check_name(sym::include))
+                        .filter(|it| it.has_name(sym::include))
                         .filter_map(|it| it.meta_item_list().map(|l| l.to_owned()))
                         .flat_map(|it| it)
-                        .filter(|meta| meta.check_name(sym::contents))
+                        .filter(|meta| meta.has_name(sym::contents))
                         .filter_map(|meta| meta.value_str())
                         .for_each(|val| {
                             result.push_str(&val.as_str());
@@ -851,54 +853,36 @@ impl<'l, 'tcx> SaveContext<'l, 'tcx> {
     }
 }
 
-fn make_signature(decl: &ast::FnDecl, generics: &ast::Generics) -> String {
-    let mut sig = "fn ".to_owned();
-    if !generics.params.is_empty() {
-        sig.push('<');
-        sig.push_str(
-            &generics
-                .params
-                .iter()
-                .map(|param| param.ident.to_string())
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
-        sig.push_str("> ");
-    }
-    sig.push('(');
-    sig.push_str(&decl.inputs.iter().map(param_to_string).collect::<Vec<_>>().join(", "));
-    sig.push(')');
-    match decl.output {
-        ast::FnRetTy::Default(_) => sig.push_str(" -> ()"),
-        ast::FnRetTy::Ty(ref t) => sig.push_str(&format!(" -> {}", ty_to_string(t))),
-    }
-
-    sig
-}
-
 // An AST visitor for collecting paths (e.g., the names of structs) and formal
 // variables (idents) from patterns.
 struct PathCollector<'l> {
-    collected_paths: Vec<(NodeId, &'l ast::Path)>,
-    collected_idents: Vec<(NodeId, ast::Ident, ast::Mutability)>,
+    tcx: TyCtxt<'l>,
+    collected_paths: Vec<(hir::HirId, &'l hir::QPath<'l>)>,
+    collected_idents: Vec<(hir::HirId, Ident, hir::Mutability)>,
 }
 
 impl<'l> PathCollector<'l> {
-    fn new() -> PathCollector<'l> {
-        PathCollector { collected_paths: vec![], collected_idents: vec![] }
+    fn new(tcx: TyCtxt<'l>) -> PathCollector<'l> {
+        PathCollector { tcx, collected_paths: vec![], collected_idents: vec![] }
     }
 }
 
 impl<'l> Visitor<'l> for PathCollector<'l> {
-    fn visit_pat(&mut self, p: &'l ast::Pat) {
+    type Map = Map<'l>;
+
+    fn nested_visit_map(&mut self) -> intravisit::NestedVisitorMap<Self::Map> {
+        intravisit::NestedVisitorMap::All(self.tcx.hir())
+    }
+
+    fn visit_pat(&mut self, p: &'l hir::Pat<'l>) {
         match p.kind {
-            PatKind::Struct(ref path, ..) => {
-                self.collected_paths.push((p.id, path));
+            hir::PatKind::Struct(ref path, ..) => {
+                self.collected_paths.push((p.hir_id, path));
             }
-            PatKind::TupleStruct(ref path, ..) | PatKind::Path(_, ref path) => {
-                self.collected_paths.push((p.id, path));
+            hir::PatKind::TupleStruct(ref path, ..) | hir::PatKind::Path(ref path) => {
+                self.collected_paths.push((p.hir_id, path));
             }
-            PatKind::Ident(bm, ident, _) => {
+            hir::PatKind::Binding(bm, _, ident, _) => {
                 debug!(
                     "PathCollector, visit ident in pat {}: {:?} {:?}",
                     ident, p.span, ident.span
@@ -907,20 +891,24 @@ impl<'l> Visitor<'l> for PathCollector<'l> {
                     // Even if the ref is mut, you can't change the ref, only
                     // the data pointed at, so showing the initialising expression
                     // is still worthwhile.
-                    ast::BindingMode::ByRef(_) => ast::Mutability::Not,
-                    ast::BindingMode::ByValue(mt) => mt,
+                    hir::BindingAnnotation::Unannotated | hir::BindingAnnotation::Ref => {
+                        hir::Mutability::Not
+                    }
+                    hir::BindingAnnotation::Mutable | hir::BindingAnnotation::RefMut => {
+                        hir::Mutability::Mut
+                    }
                 };
-                self.collected_idents.push((p.id, ident, immut));
+                self.collected_idents.push((p.hir_id, ident, immut));
             }
             _ => {}
         }
-        visit::walk_pat(self, p);
+        intravisit::walk_pat(self, p);
     }
 }
 
 /// Defines what to do with the results of saving the analysis.
 pub trait SaveHandler {
-    fn save(&mut self, save_ctxt: &SaveContext<'_, '_>, analysis: &Analysis);
+    fn save(&mut self, save_ctxt: &SaveContext<'_>, analysis: &Analysis);
 }
 
 /// Dump the save-analysis results to a file.
@@ -934,7 +922,7 @@ impl<'a> DumpHandler<'a> {
         DumpHandler { odir, cratename: cratename.to_owned() }
     }
 
-    fn output_file(&self, ctx: &SaveContext<'_, '_>) -> (BufWriter<File>, PathBuf) {
+    fn output_file(&self, ctx: &SaveContext<'_>) -> (BufWriter<File>, PathBuf) {
         let sess = &ctx.tcx.sess;
         let file_name = match ctx.config.output_file {
             Some(ref s) => PathBuf::from(s),
@@ -948,8 +936,7 @@ impl<'a> DumpHandler<'a> {
                     error!("Could not create directory {}: {}", root_path.display(), e);
                 }
 
-                let executable =
-                    sess.crate_types.borrow().iter().any(|ct| *ct == CrateType::Executable);
+                let executable = sess.crate_types().iter().any(|ct| *ct == CrateType::Executable);
                 let mut out_name = if executable { String::new() } else { "lib".to_owned() };
                 out_name.push_str(&self.cratename);
                 out_name.push_str(&sess.opts.cg.extra_filename);
@@ -971,7 +958,7 @@ impl<'a> DumpHandler<'a> {
 }
 
 impl SaveHandler for DumpHandler<'_> {
-    fn save(&mut self, save_ctxt: &SaveContext<'_, '_>, analysis: &Analysis) {
+    fn save(&mut self, save_ctxt: &SaveContext<'_>, analysis: &Analysis) {
         let sess = &save_ctxt.tcx.sess;
         let (output, file_name) = self.output_file(&save_ctxt);
         if let Err(e) = serde_json::to_writer(output, &analysis) {
@@ -990,14 +977,13 @@ pub struct CallbackHandler<'b> {
 }
 
 impl SaveHandler for CallbackHandler<'_> {
-    fn save(&mut self, _: &SaveContext<'_, '_>, analysis: &Analysis) {
+    fn save(&mut self, _: &SaveContext<'_>, analysis: &Analysis) {
         (self.callback)(analysis)
     }
 }
 
 pub fn process_crate<'l, 'tcx, H: SaveHandler>(
     tcx: TyCtxt<'tcx>,
-    krate: &ast::Crate,
     cratename: &str,
     input: &'l Input,
     config: Option<Config>,
@@ -1015,8 +1001,7 @@ pub fn process_crate<'l, 'tcx, H: SaveHandler>(
 
         let save_ctxt = SaveContext {
             tcx,
-            tables: &ty::TypeckTables::empty(None),
-            empty_tables: &ty::TypeckTables::empty(None),
+            maybe_typeck_results: None,
             access_levels: &access_levels,
             span_utils: SpanUtils::new(&tcx.sess),
             config: find_config(config),
@@ -1025,9 +1010,9 @@ pub fn process_crate<'l, 'tcx, H: SaveHandler>(
 
         let mut visitor = DumpVisitor::new(save_ctxt);
 
-        visitor.dump_crate_info(cratename, krate);
+        visitor.dump_crate_info(cratename, tcx.hir().krate());
         visitor.dump_compilation_options(input, cratename);
-        visit::walk_crate(&mut visitor, krate);
+        visitor.process_crate(tcx.hir().krate());
 
         handler.save(&visitor.save_ctxt, &visitor.analysis())
     })
@@ -1071,21 +1056,25 @@ fn id_from_def_id(id: DefId) -> rls_data::Id {
     rls_data::Id { krate: id.krate.as_u32(), index: id.index.as_u32() }
 }
 
-fn id_from_node_id(id: NodeId, scx: &SaveContext<'_, '_>) -> rls_data::Id {
-    let def_id = scx.tcx.hir().opt_local_def_id_from_node_id(id);
-    def_id.map(id_from_def_id).unwrap_or_else(|| {
-        // Create a *fake* `DefId` out of a `NodeId` by subtracting the `NodeId`
-        // out of the maximum u32 value. This will work unless you have *billions*
-        // of definitions in a single crate (very unlikely to actually happen).
-        rls_data::Id { krate: LOCAL_CRATE.as_u32(), index: !id.as_u32() }
+fn id_from_hir_id(id: hir::HirId, scx: &SaveContext<'_>) -> rls_data::Id {
+    let def_id = scx.tcx.hir().opt_local_def_id(id);
+    def_id.map(|id| id_from_def_id(id.to_def_id())).unwrap_or_else(|| {
+        // Create a *fake* `DefId` out of a `HirId` by combining the owner
+        // `local_def_index` and the `local_id`.
+        // This will work unless you have *billions* of definitions in a single
+        // crate (very unlikely to actually happen).
+        rls_data::Id {
+            krate: LOCAL_CRATE.as_u32(),
+            index: id.owner.local_def_index.as_u32() | id.local_id.as_u32().reverse_bits(),
+        }
     })
 }
 
 fn null_id() -> rls_data::Id {
-    rls_data::Id { krate: u32::max_value(), index: u32::max_value() }
+    rls_data::Id { krate: u32::MAX, index: u32::MAX }
 }
 
-fn lower_attributes(attrs: Vec<Attribute>, scx: &SaveContext<'_, '_>) -> Vec<rls_data::Attribute> {
+fn lower_attributes(attrs: Vec<ast::Attribute>, scx: &SaveContext<'_>) -> Vec<rls_data::Attribute> {
     attrs
         .into_iter()
         // Only retain real attributes. Doc comments are lowered separately.
@@ -1095,7 +1084,7 @@ fn lower_attributes(attrs: Vec<Attribute>, scx: &SaveContext<'_, '_>) -> Vec<rls
             // attribute. First normalize all inner attribute (#![..]) to outer
             // ones (#[..]), then remove the two leading and the one trailing character.
             attr.style = ast::AttrStyle::Outer;
-            let value = pprust::attribute_to_string(&attr);
+            let value = attribute_to_string(&attr);
             // This str slicing works correctly, because the leading and trailing characters
             // are in the ASCII range and thus exactly one byte each.
             let value = value[2..value.len() - 1].to_string();

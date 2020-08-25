@@ -36,6 +36,7 @@ pub struct JsonEmitter {
     pretty: bool,
     ui_testing: bool,
     json_rendered: HumanReadableErrorType,
+    terminal_width: Option<usize>,
     macro_backtrace: bool,
 }
 
@@ -45,6 +46,7 @@ impl JsonEmitter {
         source_map: Lrc<SourceMap>,
         pretty: bool,
         json_rendered: HumanReadableErrorType,
+        terminal_width: Option<usize>,
         macro_backtrace: bool,
     ) -> JsonEmitter {
         JsonEmitter {
@@ -54,6 +56,7 @@ impl JsonEmitter {
             pretty,
             ui_testing: false,
             json_rendered,
+            terminal_width,
             macro_backtrace,
         }
     }
@@ -61,6 +64,7 @@ impl JsonEmitter {
     pub fn basic(
         pretty: bool,
         json_rendered: HumanReadableErrorType,
+        terminal_width: Option<usize>,
         macro_backtrace: bool,
     ) -> JsonEmitter {
         let file_path_mapping = FilePathMapping::empty();
@@ -69,6 +73,7 @@ impl JsonEmitter {
             Lrc::new(SourceMap::new(file_path_mapping)),
             pretty,
             json_rendered,
+            terminal_width,
             macro_backtrace,
         )
     }
@@ -79,6 +84,7 @@ impl JsonEmitter {
         source_map: Lrc<SourceMap>,
         pretty: bool,
         json_rendered: HumanReadableErrorType,
+        terminal_width: Option<usize>,
         macro_backtrace: bool,
     ) -> JsonEmitter {
         JsonEmitter {
@@ -88,6 +94,7 @@ impl JsonEmitter {
             pretty,
             ui_testing: false,
             json_rendered,
+            terminal_width,
             macro_backtrace,
         }
     }
@@ -138,7 +145,7 @@ impl Emitter for JsonEmitter {
 
 // The following data types are provided just for serialisation.
 
-#[derive(RustcEncodable)]
+#[derive(Encodable)]
 struct Diagnostic {
     /// The primary error message.
     message: String,
@@ -152,7 +159,7 @@ struct Diagnostic {
     rendered: Option<String>,
 }
 
-#[derive(RustcEncodable)]
+#[derive(Encodable)]
 struct DiagnosticSpan {
     file_name: String,
     byte_start: u32,
@@ -179,7 +186,7 @@ struct DiagnosticSpan {
     expansion: Option<Box<DiagnosticSpanMacroExpansion>>,
 }
 
-#[derive(RustcEncodable)]
+#[derive(Encodable)]
 struct DiagnosticSpanLine {
     text: String,
 
@@ -189,7 +196,7 @@ struct DiagnosticSpanLine {
     highlight_end: usize,
 }
 
-#[derive(RustcEncodable)]
+#[derive(Encodable)]
 struct DiagnosticSpanMacroExpansion {
     /// span where macro was applied to generate this code; note that
     /// this may itself derive from a macro (if
@@ -203,7 +210,7 @@ struct DiagnosticSpanMacroExpansion {
     def_site_span: DiagnosticSpan,
 }
 
-#[derive(RustcEncodable)]
+#[derive(Encodable)]
 struct DiagnosticCode {
     /// The code itself.
     code: String,
@@ -211,7 +218,7 @@ struct DiagnosticCode {
     explanation: Option<&'static str>,
 }
 
-#[derive(RustcEncodable)]
+#[derive(Encodable)]
 struct ArtifactNotification<'a> {
     /// The path of the artifact.
     artifact: &'a Path,
@@ -247,7 +254,13 @@ impl Diagnostic {
         let buf = BufWriter::default();
         let output = buf.clone();
         je.json_rendered
-            .new_emitter(Box::new(buf), Some(je.sm.clone()), false, None, je.macro_backtrace)
+            .new_emitter(
+                Box::new(buf),
+                Some(je.sm.clone()),
+                false,
+                je.terminal_width,
+                je.macro_backtrace,
+            )
             .ui_testing(je.ui_testing)
             .emit_diagnostic(diag);
         let output = Arc::try_unwrap(output.0).unwrap().into_inner().unwrap();

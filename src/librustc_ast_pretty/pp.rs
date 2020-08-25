@@ -1,10 +1,8 @@
 //! This pretty-printer is a direct reimplementation of Philip Karlton's
-//! Mesa pretty-printer, as described in appendix A of
-//!
-//! ```text
-//! STAN-CS-79-770: "Pretty Printing", by Derek C. Oppen.
-//! Stanford Department of Computer Science, 1979.
-//! ```
+//! Mesa pretty-printer, as described in the appendix to
+//! Derek C. Oppen, "Pretty Printing" (1979),
+//! Stanford Computer Science Department STAN-CS-79-770,
+//! <http://i.stanford.edu/pub/cstr/reports/cs/tr/79/770/CS-TR-79-770.pdf>.
 //!
 //! The algorithm's aim is to break a stream into as few lines as possible
 //! while respecting the indentation-consistency requirements of the enclosing
@@ -134,10 +132,10 @@
 //! methods called `Printer::scan_*`, and the 'PRINT' process is the
 //! method called `Printer::print`.
 
-use log::debug;
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt;
+use tracing::debug;
 
 /// How to break. Described in more detail in the module docs.
 #[derive(Clone, Copy, PartialEq)]

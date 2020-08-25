@@ -10,4 +10,16 @@ fn b() {
     //~^ ERROR expected identifier, found reserved identifier `_`
 }
 
+fn c() {
+    [0; [|&_: _ &_| {}; 0 ].len()]
+    //~^ ERROR expected `,`, found `&`
+    //~| ERROR mismatched types
+}
+
+fn d() {
+    [0; match [|f @ &ref _| () ] {} ]
+    //~^ ERROR expected identifier, found reserved identifier `_`
+    //~| ERROR mismatched types
+}
+
 fn main() {}

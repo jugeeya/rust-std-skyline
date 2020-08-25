@@ -2,9 +2,9 @@
 //!
 //! - **Traits.** Trait resolution is implemented in the `traits` module.
 //!
-//! For more information about how rustc works, see the [rustc guide].
+//! For more information about how rustc works, see the [rustc-dev-guide].
 //!
-//! [rustc guide]: https://rust-lang.github.io/rustc-guide/
+//! [rustc-dev-guide]: https://rustc-dev-guide.rust-lang.org/
 //!
 //! # Note
 //!
@@ -24,10 +24,11 @@ extern crate rustc_macros;
 #[macro_use]
 extern crate rustc_data_structures;
 #[macro_use]
-extern crate log;
+extern crate tracing;
 #[macro_use]
 extern crate rustc_middle;
 
+pub mod autoderef;
 pub mod infer;
 pub mod opaque_types;
 pub mod traits;

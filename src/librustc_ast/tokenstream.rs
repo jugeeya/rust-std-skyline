@@ -35,7 +35,7 @@ use std::{iter, mem};
 ///
 /// The RHS of an MBE macro is the only place `SubstNt`s are substituted.
 /// Nothing special happens to misnamed or misplaced `SubstNt`s.
-#[derive(Debug, Clone, PartialEq, RustcEncodable, RustcDecodable, HashStable_Generic)]
+#[derive(Debug, Clone, PartialEq, Encodable, Decodable, HashStable_Generic)]
 pub enum TokenTree {
     /// A single token
     Token(Token),
@@ -61,23 +61,6 @@ impl TokenTree {
             (TokenTree::Token(token), TokenTree::Token(token2)) => token.kind == token2.kind,
             (TokenTree::Delimited(_, delim, tts), TokenTree::Delimited(_, delim2, tts2)) => {
                 delim == delim2 && tts.eq_unspanned(&tts2)
-            }
-            _ => false,
-        }
-    }
-
-    // See comments in `Nonterminal::to_tokenstream` for why we care about
-    // *probably* equal here rather than actual equality
-    //
-    // This is otherwise the same as `eq_unspanned`, only recursing with a
-    // different method.
-    pub fn probably_equal_for_proc_macro(&self, other: &TokenTree) -> bool {
-        match (self, other) {
-            (TokenTree::Token(token), TokenTree::Token(token2)) => {
-                token.probably_equal_for_proc_macro(token2)
-            }
-            (TokenTree::Delimited(_, delim, tts), TokenTree::Delimited(_, delim2, tts2)) => {
-                delim == delim2 && tts.probably_equal_for_proc_macro(&tts2)
             }
             _ => false,
         }
@@ -141,7 +124,7 @@ where
 /// The goal is for procedural macros to work with `TokenStream`s and `TokenTree`s
 /// instead of a representation of the abstract syntax tree.
 /// Today's `TokenTree`s can still contain AST via `token::Interpolated` for back-compat.
-#[derive(Clone, Debug, Default, RustcEncodable, RustcDecodable)]
+#[derive(Clone, Debug, Default, Encodable, Decodable)]
 pub struct TokenStream(pub Lrc<Vec<TreeAndJoint>>);
 
 pub type TreeAndJoint = (TokenTree, IsJoint);
@@ -150,7 +133,7 @@ pub type TreeAndJoint = (TokenTree, IsJoint);
 #[cfg(target_arch = "x86_64")]
 rustc_data_structures::static_assert_size!(TokenStream, 8);
 
-#[derive(Clone, Copy, Debug, PartialEq, RustcEncodable, RustcDecodable)]
+#[derive(Clone, Copy, Debug, PartialEq, Encodable, Decodable)]
 pub enum IsJoint {
     Joint,
     NonJoint,
@@ -305,49 +288,6 @@ impl TokenStream {
         t1.next().is_none() && t2.next().is_none()
     }
 
-    // See comments in `Nonterminal::to_tokenstream` for why we care about
-    // *probably* equal here rather than actual equality
-    //
-    // This is otherwise the same as `eq_unspanned`, only recursing with a
-    // different method.
-    pub fn probably_equal_for_proc_macro(&self, other: &TokenStream) -> bool {
-        // When checking for `probably_eq`, we ignore certain tokens that aren't
-        // preserved in the AST. Because they are not preserved, the pretty
-        // printer arbitrarily adds or removes them when printing as token
-        // streams, making a comparison between a token stream generated from an
-        // AST and a token stream which was parsed into an AST more reliable.
-        fn semantic_tree(tree: &TokenTree) -> bool {
-            if let TokenTree::Token(token) = tree {
-                if let
-                    // The pretty printer tends to add trailing commas to
-                    // everything, and in particular, after struct fields.
-                    | token::Comma
-                    // The pretty printer emits `NoDelim` as whitespace.
-                    | token::OpenDelim(DelimToken::NoDelim)
-                    | token::CloseDelim(DelimToken::NoDelim)
-                    // The pretty printer collapses many semicolons into one.
-                    | token::Semi
-                    // The pretty printer collapses whitespace arbitrarily and can
-                    // introduce whitespace from `NoDelim`.
-                    | token::Whitespace
-                    // The pretty printer can turn `$crate` into `::crate_name`
-                    | token::ModSep = token.kind {
-                    return false;
-                }
-            }
-            true
-        }
-
-        let mut t1 = self.trees().filter(semantic_tree);
-        let mut t2 = other.trees().filter(semantic_tree);
-        for (t1, t2) in t1.by_ref().zip(t2.by_ref()) {
-            if !t1.probably_equal_for_proc_macro(&t2) {
-                return false;
-            }
-        }
-        t1.next().is_none() && t2.next().is_none()
-    }
-
     pub fn map_enumerated<F: FnMut(usize, TokenTree) -> TokenTree>(self, mut f: F) -> TokenStream {
         TokenStream(Lrc::new(
             self.0
@@ -468,7 +408,7 @@ impl Cursor {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, RustcEncodable, RustcDecodable, HashStable_Generic)]
+#[derive(Debug, Copy, Clone, PartialEq, Encodable, Decodable, HashStable_Generic)]
 pub struct DelimSpan {
     pub open: Span,
     pub close: Span,

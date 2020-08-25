@@ -117,6 +117,7 @@ impl<'a, 'hir> NodeCollector<'a, 'hir> {
                 body_ids: _,
                 modules: _,
                 proc_macros: _,
+                trait_map: _,
             } = *krate;
 
             hash_body(&mut hcx, root_mod_def_path_hash, item, &mut hir_body_nodes)
@@ -241,32 +242,22 @@ impl<'a, 'hir> NodeCollector<'a, 'hir> {
         // Make sure that the DepNode of some node coincides with the HirId
         // owner of that node.
         if cfg!(debug_assertions) {
-            let node_id = self.definitions.hir_id_to_node_id(hir_id);
-            assert_eq!(self.definitions.node_id_to_hir_id(node_id), hir_id);
-
             if hir_id.owner != self.current_dep_node_owner {
-                let node_str = match self.definitions.opt_local_def_id(node_id) {
+                let node_str = match self.definitions.opt_hir_id_to_local_def_id(hir_id) {
                     Some(def_id) => self.definitions.def_path(def_id).to_string_no_crate(),
                     None => format!("{:?}", node),
-                };
-
-                let forgot_str = if hir_id == hir::DUMMY_HIR_ID {
-                    format!("\nMaybe you forgot to lower the node id {:?}?", node_id)
-                } else {
-                    String::new()
                 };
 
                 span_bug!(
                     span,
                     "inconsistent DepNode at `{:?}` for `{}`: \
-                     current_dep_node_owner={} ({:?}), hir_id.owner={} ({:?}){}",
+                     current_dep_node_owner={} ({:?}), hir_id.owner={} ({:?})",
                     self.source_map.span_to_string(span),
                     node_str,
                     self.definitions.def_path(self.current_dep_node_owner).to_string_no_crate(),
                     self.current_dep_node_owner,
                     self.definitions.def_path(hir_id.owner).to_string_no_crate(),
                     hir_id.owner,
-                    forgot_str,
                 )
             }
         }
@@ -342,9 +333,7 @@ impl<'a, 'hir> Visitor<'hir> for NodeCollector<'a, 'hir> {
         debug!("visit_item: {:?}", i);
         debug_assert_eq!(
             i.hir_id.owner,
-            self.definitions
-                .opt_local_def_id(self.definitions.hir_id_to_node_id(i.hir_id))
-                .unwrap()
+            self.definitions.opt_hir_id_to_local_def_id(i.hir_id).unwrap()
         );
         self.with_dep_node_owner(i.hir_id.owner, i, |this, hash| {
             this.insert_with_hash(i.span, i.hir_id, Node::Item(i), hash);
@@ -376,9 +365,7 @@ impl<'a, 'hir> Visitor<'hir> for NodeCollector<'a, 'hir> {
     fn visit_trait_item(&mut self, ti: &'hir TraitItem<'hir>) {
         debug_assert_eq!(
             ti.hir_id.owner,
-            self.definitions
-                .opt_local_def_id(self.definitions.hir_id_to_node_id(ti.hir_id))
-                .unwrap()
+            self.definitions.opt_hir_id_to_local_def_id(ti.hir_id).unwrap()
         );
         self.with_dep_node_owner(ti.hir_id.owner, ti, |this, hash| {
             this.insert_with_hash(ti.span, ti.hir_id, Node::TraitItem(ti), hash);
@@ -392,9 +379,7 @@ impl<'a, 'hir> Visitor<'hir> for NodeCollector<'a, 'hir> {
     fn visit_impl_item(&mut self, ii: &'hir ImplItem<'hir>) {
         debug_assert_eq!(
             ii.hir_id.owner,
-            self.definitions
-                .opt_local_def_id(self.definitions.hir_id_to_node_id(ii.hir_id))
-                .unwrap()
+            self.definitions.opt_hir_id_to_local_def_id(ii.hir_id).unwrap()
         );
         self.with_dep_node_owner(ii.hir_id.owner, ii, |this, hash| {
             this.insert_with_hash(ii.span, ii.hir_id, Node::ImplItem(ii), hash);

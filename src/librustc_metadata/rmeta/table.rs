@@ -1,11 +1,11 @@
 use crate::rmeta::*;
 
-use log::debug;
 use rustc_index::vec::Idx;
-use rustc_serialize::{opaque::Encoder, Encodable};
+use rustc_serialize::opaque::Encoder;
 use std::convert::TryInto;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
+use tracing::debug;
 
 /// Helper trait, for encoding to, and decoding from, a fixed number of bytes.
 /// Used mainly for Lazy positions and lengths.
@@ -42,10 +42,7 @@ macro_rules! fixed_size_encoding_byte_len_and_defaults {
             // but slicing `[u8]` with `i * N..` is optimized worse, due to the
             // possibility of `i * N` overflowing, than indexing `[[u8; N]]`.
             let b = unsafe {
-                std::slice::from_raw_parts(
-                    b.as_ptr() as *const [u8; BYTE_LEN],
-                    b.len() / BYTE_LEN,
-                )
+                std::slice::from_raw_parts(b.as_ptr() as *const [u8; BYTE_LEN], b.len() / BYTE_LEN)
             };
             b.get(i).map(|b| FixedSizeEncoding::from_bytes(b))
         }
@@ -61,7 +58,7 @@ macro_rules! fixed_size_encoding_byte_len_and_defaults {
             };
             self.write_to_bytes(&mut b[i]);
         }
-    }
+    };
 }
 
 impl FixedSizeEncoding for u32 {
@@ -81,7 +78,7 @@ impl FixedSizeEncoding for u32 {
 // NOTE(eddyb) there could be an impl for `usize`, which would enable a more
 // generic `Lazy<T>` impl, but in the general case we might not need / want to
 // fit every `usize` in `u32`.
-impl<T: Encodable> FixedSizeEncoding for Option<Lazy<T>> {
+impl<T> FixedSizeEncoding for Option<Lazy<T>> {
     fixed_size_encoding_byte_len_and_defaults!(u32::BYTE_LEN);
 
     fn from_bytes(b: &[u8]) -> Self {
@@ -96,7 +93,7 @@ impl<T: Encodable> FixedSizeEncoding for Option<Lazy<T>> {
     }
 }
 
-impl<T: Encodable> FixedSizeEncoding for Option<Lazy<[T]>> {
+impl<T> FixedSizeEncoding for Option<Lazy<[T]>> {
     fixed_size_encoding_byte_len_and_defaults!(u32::BYTE_LEN * 2);
 
     fn from_bytes(b: &[u8]) -> Self {
@@ -158,7 +155,7 @@ impl<I: Idx, T> TableBuilder<I, T>
 where
     Option<T>: FixedSizeEncoding,
 {
-    pub(super) fn set(&mut self, i: I, value: T) {
+    pub(crate) fn set(&mut self, i: I, value: T) {
         // FIXME(eddyb) investigate more compact encodings for sparse tables.
         // On the PR @michaelwoerister mentioned:
         // > Space requirements could perhaps be optimized by using the HAMT `popcnt`
@@ -173,7 +170,7 @@ where
         Some(value).write_to_bytes_at(&mut self.bytes, i);
     }
 
-    pub(super) fn encode(&self, buf: &mut Encoder) -> Lazy<Table<I, T>> {
+    pub(crate) fn encode(&self, buf: &mut Encoder) -> Lazy<Table<I, T>> {
         let pos = buf.position();
         buf.emit_raw_bytes(&self.bytes);
         Lazy::from_position_and_meta(NonZeroUsize::new(pos as usize).unwrap(), self.bytes.len())
@@ -203,5 +200,10 @@ where
         let start = self.position.get();
         let bytes = &metadata.raw_bytes()[start..start + self.meta];
         <Option<T>>::maybe_read_from_bytes_at(bytes, i.index())?
+    }
+
+    /// Size of the table in entries, including possible gaps.
+    pub(super) fn size(&self) -> usize {
+        self.meta / <Option<T>>::BYTE_LEN
     }
 }

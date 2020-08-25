@@ -1,4 +1,4 @@
-use rustc_ast::ast::{FloatTy, IntTy, UintTy};
+use rustc_ast::{FloatTy, IntTy, UintTy};
 use rustc_data_structures::base_n;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir as hir;
@@ -153,7 +153,7 @@ impl SymbolMangler<'tcx> {
 
         // Write a separating `_` if necessary (leading digit or `_`).
         match ident.chars().next() {
-            Some('_') | Some('0'..='9') => {
+            Some('_' | '0'..='9') => {
                 self.push("_");
             }
             _ => {}
@@ -219,7 +219,7 @@ impl SymbolMangler<'tcx> {
         lifetime_depths.end += lifetimes;
 
         self.binders.push(BinderLevel { lifetime_depths });
-        self = print_value(self, value.skip_binder())?;
+        self = print_value(self, value.as_ref().skip_binder())?;
         self.binders.pop();
 
         Ok(self)
@@ -271,7 +271,7 @@ impl Printer<'tcx> for SymbolMangler<'tcx> {
         let key = self.tcx.def_key(impl_def_id);
         let parent_def_id = DefId { index: key.parent.unwrap(), ..impl_def_id };
 
-        let mut param_env = self.tcx.param_env(impl_def_id).with_reveal_all();
+        let mut param_env = self.tcx.param_env_reveal_all_normalized(impl_def_id);
         if !substs.is_empty() {
             param_env = param_env.subst(self.tcx, substs);
         }
@@ -345,7 +345,7 @@ impl Printer<'tcx> for SymbolMangler<'tcx> {
             ty::Never => "z",
 
             // Placeholders (should be demangled as `_`).
-            ty::Param(_) | ty::Bound(..) | ty::Placeholder(_) | ty::Infer(_) | ty::Error => "p",
+            ty::Param(_) | ty::Bound(..) | ty::Placeholder(_) | ty::Infer(_) | ty::Error(_) => "p",
 
             _ => "",
         };
@@ -367,7 +367,7 @@ impl Printer<'tcx> for SymbolMangler<'tcx> {
             ty::Tuple(_) if ty.is_unit() => unreachable!(),
 
             // Placeholders, also handled as part of basic types.
-            ty::Param(_) | ty::Bound(..) | ty::Placeholder(_) | ty::Infer(_) | ty::Error => {
+            ty::Param(_) | ty::Bound(..) | ty::Placeholder(_) | ty::Infer(_) | ty::Error(_) => {
                 unreachable!()
             }
 
@@ -413,7 +413,6 @@ impl Printer<'tcx> for SymbolMangler<'tcx> {
             | ty::FnDef(def_id, substs)
             | ty::Opaque(def_id, substs)
             | ty::Projection(ty::ProjectionTy { item_def_id: def_id, substs })
-            | ty::UnnormalizedProjection(ty::ProjectionTy { item_def_id: def_id, substs })
             | ty::Closure(def_id, substs)
             | ty::Generator(def_id, substs, _) => {
                 self = self.print_def_path(def_id, substs)?;
@@ -478,7 +477,7 @@ impl Printer<'tcx> for SymbolMangler<'tcx> {
         predicates: &'tcx ty::List<ty::ExistentialPredicate<'tcx>>,
     ) -> Result<Self::DynExistential, Self::Error> {
         for predicate in predicates {
-            match *predicate {
+            match predicate {
                 ty::ExistentialPredicate::Trait(trait_ref) => {
                     // Use a type that can't appear in defaults of type parameters.
                     let dummy_self = self.tcx.mk_ty_infer(ty::FreshTy(0));
@@ -637,9 +636,7 @@ impl Printer<'tcx> for SymbolMangler<'tcx> {
                 }
                 GenericArgKind::Const(c) => {
                     self.push("K");
-                    // FIXME(const_generics) implement `ty::print::Print` on `ty::Const`.
-                    // self = c.print(self)?;
-                    self = self.print_const(c)?;
+                    self = c.print(self)?;
                 }
             }
         }

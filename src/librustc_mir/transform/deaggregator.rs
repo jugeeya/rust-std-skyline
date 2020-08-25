@@ -6,32 +6,30 @@ use rustc_middle::ty::TyCtxt;
 pub struct Deaggregator;
 
 impl<'tcx> MirPass<'tcx> for Deaggregator {
-    fn run_pass(&self, tcx: TyCtxt<'tcx>, _source: MirSource<'tcx>, body: &mut BodyAndCache<'tcx>) {
+    fn run_pass(&self, tcx: TyCtxt<'tcx>, _source: MirSource<'tcx>, body: &mut Body<'tcx>) {
         let (basic_blocks, local_decls) = body.basic_blocks_and_local_decls_mut();
         let local_decls = &*local_decls;
         for bb in basic_blocks {
             bb.expand_statements(|stmt| {
                 // FIXME(eddyb) don't match twice on `stmt.kind` (post-NLL).
-                if let StatementKind::Assign(box (_, ref rhs)) = stmt.kind {
-                    if let Rvalue::Aggregate(ref kind, _) = *rhs {
-                        // FIXME(#48193) Deaggregate arrays when it's cheaper to do so.
-                        if let AggregateKind::Array(_) = **kind {
-                            return None;
-                        }
-                    } else {
+                match stmt.kind {
+                    // FIXME(#48193) Deaggregate arrays when it's cheaper to do so.
+                    StatementKind::Assign(box (
+                        _,
+                        Rvalue::Aggregate(box AggregateKind::Array(_), _),
+                    )) => {
                         return None;
                     }
-                } else {
-                    return None;
+                    StatementKind::Assign(box (_, Rvalue::Aggregate(_, _))) => {}
+                    _ => return None,
                 }
 
                 let stmt = stmt.replace_nop();
                 let source_info = stmt.source_info;
                 let (lhs, kind, operands) = match stmt.kind {
-                    StatementKind::Assign(box (lhs, rvalue)) => match rvalue {
-                        Rvalue::Aggregate(kind, operands) => (lhs, kind, operands),
-                        _ => bug!(),
-                    },
+                    StatementKind::Assign(box (lhs, Rvalue::Aggregate(kind, operands))) => {
+                        (lhs, kind, operands)
+                    }
                     _ => bug!(),
                 };
 

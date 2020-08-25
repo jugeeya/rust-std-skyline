@@ -1,11 +1,12 @@
 use crate::build;
 use crate::build::scope::DropKind;
-use crate::hair::cx::Cx;
-use crate::hair::{BindingMode, LintLevel, PatKind};
+use crate::thir::cx::Cx;
+use crate::thir::{BindingMode, LintLevel, PatKind};
 use rustc_attr::{self as attr, UnwindAttr};
+use rustc_errors::ErrorReported;
 use rustc_hir as hir;
-use rustc_hir::def_id::DefId;
-use rustc_hir::lang_items;
+use rustc_hir::def_id::{DefId, LocalDefId};
+use rustc_hir::lang_items::LangItem;
 use rustc_hir::{GeneratorKind, HirIdMap, Node};
 use rustc_index::vec::{Idx, IndexVec};
 use rustc_infer::infer::TyCtxtInferExt;
@@ -20,51 +21,71 @@ use rustc_target::spec::PanicStrategy;
 
 use super::lints;
 
-crate fn mir_built(tcx: TyCtxt<'_>, def_id: DefId) -> &ty::steal::Steal<BodyAndCache<'_>> {
-    tcx.alloc_steal_mir(mir_build(tcx, def_id))
+crate fn mir_built<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def: ty::WithOptConstParam<LocalDefId>,
+) -> &'tcx ty::steal::Steal<Body<'tcx>> {
+    if let Some(def) = def.try_upgrade(tcx) {
+        return tcx.mir_built(def);
+    }
+
+    tcx.alloc_steal_mir(mir_build(tcx, def))
 }
 
 /// Construct the MIR for a given `DefId`.
-fn mir_build(tcx: TyCtxt<'_>, def_id: DefId) -> BodyAndCache<'_> {
-    let id = tcx.hir().as_local_hir_id(def_id).unwrap();
+fn mir_build(tcx: TyCtxt<'_>, def: ty::WithOptConstParam<LocalDefId>) -> Body<'_> {
+    let id = tcx.hir().local_def_id_to_hir_id(def.did);
 
     // Figure out what primary body this item has.
-    let (body_id, return_ty_span) = match tcx.hir().get(id) {
+    let (body_id, return_ty_span, span_with_body) = match tcx.hir().get(id) {
         Node::Expr(hir::Expr { kind: hir::ExprKind::Closure(_, decl, body_id, _, _), .. }) => {
-            (*body_id, decl.output.span())
+            (*body_id, decl.output.span(), None)
         }
         Node::Item(hir::Item {
             kind: hir::ItemKind::Fn(hir::FnSig { decl, .. }, _, body_id),
+            span,
             ..
         })
         | Node::ImplItem(hir::ImplItem {
             kind: hir::ImplItemKind::Fn(hir::FnSig { decl, .. }, body_id),
+            span,
             ..
         })
         | Node::TraitItem(hir::TraitItem {
             kind: hir::TraitItemKind::Fn(hir::FnSig { decl, .. }, hir::TraitFn::Provided(body_id)),
+            span,
             ..
-        }) => (*body_id, decl.output.span()),
-        Node::Item(hir::Item { kind: hir::ItemKind::Static(ty, _, body_id), .. })
-        | Node::Item(hir::Item { kind: hir::ItemKind::Const(ty, body_id), .. })
+        }) => {
+            // Use the `Span` of the `Item/ImplItem/TraitItem` as the body span,
+            // since the def span of a function does not include the body
+            (*body_id, decl.output.span(), Some(*span))
+        }
+        Node::Item(hir::Item {
+            kind: hir::ItemKind::Static(ty, _, body_id) | hir::ItemKind::Const(ty, body_id),
+            ..
+        })
         | Node::ImplItem(hir::ImplItem { kind: hir::ImplItemKind::Const(ty, body_id), .. })
         | Node::TraitItem(hir::TraitItem {
             kind: hir::TraitItemKind::Const(ty, Some(body_id)),
             ..
-        }) => (*body_id, ty.span),
-        Node::AnonConst(hir::AnonConst { body, hir_id, .. }) => (*body, tcx.hir().span(*hir_id)),
+        }) => (*body_id, ty.span, None),
+        Node::AnonConst(hir::AnonConst { body, hir_id, .. }) => (*body, tcx.hir().span(*hir_id), None),
 
-        _ => span_bug!(tcx.hir().span(id), "can't build MIR for {:?}", def_id),
+        _ => span_bug!(tcx.hir().span(id), "can't build MIR for {:?}", def.did),
     };
 
+    // If we don't have a specialized span for the body, just use the
+    // normal def span.
+    let span_with_body = span_with_body.unwrap_or_else(|| tcx.hir().span(id));
+
     tcx.infer_ctxt().enter(|infcx| {
-        let cx = Cx::new(&infcx, id);
-        let body = if cx.tables().tainted_by_errors {
+        let cx = Cx::new(&infcx, def, id);
+        let body = if let Some(ErrorReported) = cx.typeck_results().tainted_by_errors {
             build::construct_error(cx, body_id)
         } else if cx.body_owner_kind.is_fn_or_closure() {
             // fetch the fully liberated fn signature (that is, all bound
             // types/lifetimes replaced)
-            let fn_sig = cx.tables().liberated_fn_sigs()[id];
+            let fn_sig = cx.typeck_results().liberated_fn_sigs()[id];
             let fn_def_id = tcx.hir().local_def_id(id);
 
             let safety = match fn_sig.unsafety {
@@ -83,7 +104,7 @@ fn mir_build(tcx: TyCtxt<'_>, def_id: DefId) -> BodyAndCache<'_> {
                     vec![ArgInfo(liberated_closure_env_ty(tcx, id, body_id), None, None, None)]
                 }
                 ty::Generator(..) => {
-                    let gen_ty = tcx.body_tables(body_id).node_type(id);
+                    let gen_ty = tcx.typeck_body(body_id).node_type(id);
 
                     // The resume argument may be missing, in that case we need to provide it here.
                     // It will always be `()` in this case.
@@ -124,8 +145,7 @@ fn mir_build(tcx: TyCtxt<'_>, def_id: DefId) -> BodyAndCache<'_> {
                 // C-variadic fns also have a `VaList` input that's not listed in `fn_sig`
                 // (as it's created inside the body itself, not passed in from outside).
                 let ty = if fn_sig.c_variadic && index == fn_sig.inputs().len() {
-                    let va_list_did =
-                        tcx.require_lang_item(lang_items::VaListTypeLangItem, Some(arg.span));
+                    let va_list_did = tcx.require_lang_item(LangItem::VaList, Some(arg.span));
 
                     tcx.type_of(va_list_did).subst(tcx, &[tcx.lifetimes.re_erased.into()])
                 } else {
@@ -138,7 +158,7 @@ fn mir_build(tcx: TyCtxt<'_>, def_id: DefId) -> BodyAndCache<'_> {
             let arguments = implicit_argument.into_iter().chain(explicit_arguments);
 
             let (yield_ty, return_ty) = if body.generator_kind.is_some() {
-                let gen_ty = tcx.body_tables(body_id).node_type(id);
+                let gen_ty = tcx.typeck_body(body_id).node_type(id);
                 let gen_sig = match gen_ty.kind {
                     ty::Generator(_, gen_substs, ..) => gen_substs.as_generator().sig(),
                     _ => span_bug!(tcx.hir().span(id), "generator w/o generator type: {:?}", ty),
@@ -157,6 +177,7 @@ fn mir_build(tcx: TyCtxt<'_>, def_id: DefId) -> BodyAndCache<'_> {
                 return_ty,
                 return_ty_span,
                 body,
+                span_with_body
             );
             mir.yield_ty = yield_ty;
             mir
@@ -173,15 +194,12 @@ fn mir_build(tcx: TyCtxt<'_>, def_id: DefId) -> BodyAndCache<'_> {
             // place to be the type of the constant because NLL typeck will
             // equate them.
 
-            let return_ty = cx.tables().node_type(id);
+            let return_ty = cx.typeck_results().node_type(id);
 
             build::construct_const(cx, body_id, return_ty, return_ty_span)
         };
 
-        let mut body = BodyAndCache::new(body);
-        body.ensure_predecessors();
-
-        lints::check(tcx, &body.unwrap_read_only(), def_id);
+        lints::check(tcx, &body, def.did);
 
         // The borrow checker will replace all the regions here with its own
         // inference variables. There's no point having non-erased regions here.
@@ -208,7 +226,7 @@ fn liberated_closure_env_ty(
     closure_expr_id: hir::HirId,
     body_id: hir::BodyId,
 ) -> Ty<'_> {
-    let closure_ty = tcx.body_tables(body_id).node_type(closure_expr_id);
+    let closure_ty = tcx.typeck_body(body_id).node_type(closure_expr_id);
 
     let (closure_def_id, closure_substs) = match closure_ty.kind {
         ty::Closure(closure_def_id, closure_substs) => (closure_def_id, closure_substs),
@@ -242,6 +260,9 @@ enum BlockFrame {
         ///
         /// Example: `let _ = { STMT_1; EXPR };`
         tail_result_is_ignored: bool,
+
+        /// `Span` of the tail expression.
+        span: Span,
     },
 
     /// Generic mark meaning that the block occurred as a subexpression
@@ -283,7 +304,7 @@ struct Builder<'a, 'tcx> {
     /// see the `scope` module for more details.
     scopes: scope::Scopes<'tcx>,
 
-    /// The block-context: each time we build the code within an hair::Block,
+    /// The block-context: each time we build the code within an thir::Block,
     /// we push a frame here tracking whether we are building a statement or
     /// if we are pushing the tail expression of the block. This is used to
     /// embed information in generated temps about whether they were created
@@ -369,8 +390,8 @@ impl BlockContext {
             match bf {
                 BlockFrame::SubExpr => continue,
                 BlockFrame::Statement { .. } => break,
-                &BlockFrame::TailExpr { tail_result_is_ignored } => {
-                    return Some(BlockTailInfo { tail_result_is_ignored });
+                &BlockFrame::TailExpr { tail_result_is_ignored, span } => {
+                    return Some(BlockTailInfo { tail_result_is_ignored, span });
                 }
             }
         }
@@ -393,8 +414,10 @@ impl BlockContext {
             Some(BlockFrame::SubExpr) => false,
 
             // otherwise: use accumulated is_ignored state.
-            Some(BlockFrame::TailExpr { tail_result_is_ignored: ignored })
-            | Some(BlockFrame::Statement { ignores_expr_result: ignored }) => *ignored,
+            Some(
+                BlockFrame::TailExpr { tail_result_is_ignored: ignored, .. }
+                | BlockFrame::Statement { ignores_expr_result: ignored },
+            ) => *ignored,
         }
     }
 }
@@ -521,18 +544,13 @@ macro_rules! unpack {
     }};
 }
 
-fn should_abort_on_panic(tcx: TyCtxt<'_>, fn_def_id: DefId, _abi: Abi) -> bool {
+fn should_abort_on_panic(tcx: TyCtxt<'_>, fn_def_id: LocalDefId, _abi: Abi) -> bool {
     // Validate `#[unwind]` syntax regardless of platform-specific panic strategy.
-    let attrs = &tcx.get_attrs(fn_def_id);
-    let unwind_attr = attr::find_unwind_attr(Some(tcx.sess.diagnostic()), attrs);
+    let attrs = &tcx.get_attrs(fn_def_id.to_def_id());
+    let unwind_attr = attr::find_unwind_attr(&tcx.sess, attrs);
 
     // We never unwind, so it's not relevant to stop an unwind.
     if tcx.sess.panic_strategy() != PanicStrategy::Unwind {
-        return false;
-    }
-
-    // We cannot add landing pads, so don't add one.
-    if tcx.sess.no_landing_pads() {
         return false;
     }
 
@@ -564,6 +582,7 @@ fn construct_fn<'a, 'tcx, A>(
     return_ty: Ty<'tcx>,
     return_ty_span: Span,
     body: &'tcx hir::Body<'tcx>,
+    span_with_body: Span
 ) -> Body<'tcx>
 where
     A: Iterator<Item = ArgInfo<'tcx>>,
@@ -578,7 +597,7 @@ where
 
     let mut builder = Builder::new(
         hir,
-        span,
+        span_with_body,
         arguments.len(),
         safety,
         return_ty,
@@ -611,7 +630,7 @@ where
                         builder.in_scope(arg_scope_s, LintLevel::Inherited, |builder| {
                             builder.args_and_body(
                                 block,
-                                fn_def_id,
+                                fn_def_id.to_def_id(),
                                 &arguments,
                                 arg_scope,
                                 &body.value,
@@ -621,7 +640,7 @@ where
                 )
             );
             // Attribute epilogue to function's closing brace
-            let fn_end = span.shrink_to_hi();
+            let fn_end = span_with_body.shrink_to_hi();
             let source_info = builder.source_info(fn_end);
             let return_block = builder.return_block();
             builder.cfg.goto(block, source_info, return_block);
@@ -641,7 +660,7 @@ where
     } else {
         None
     };
-    debug!("fn_id {:?} has attrs {:?}", fn_def_id, tcx.get_attrs(fn_def_id));
+    debug!("fn_id {:?} has attrs {:?}", fn_def_id, tcx.get_attrs(fn_def_id.to_def_id()));
 
     let mut body = builder.finish();
     body.spread_arg = spread_arg;
@@ -687,7 +706,7 @@ fn construct_error<'a, 'tcx>(hir: Cx<'a, 'tcx>, body_id: hir::BodyId) -> Body<'t
     let tcx = hir.tcx();
     let owner_id = tcx.hir().body_owner(body_id);
     let span = tcx.hir().span(owner_id);
-    let ty = tcx.types.err;
+    let ty = tcx.ty_error();
     let num_params = match hir.body_owner_kind {
         hir::BodyOwnerKind::Fn => tcx.hir().fn_decl_by_hir_id(owner_id).unwrap().inputs.len(),
         hir::BodyOwnerKind::Closure => {
@@ -708,15 +727,7 @@ fn construct_error<'a, 'tcx>(hir: Cx<'a, 'tcx>, body_id: hir::BodyId) -> Body<'t
     // Some MIR passes will expect the number of parameters to match the
     // function declaration.
     for _ in 0..num_params {
-        builder.local_decls.push(LocalDecl {
-            mutability: Mutability::Mut,
-            ty,
-            user_ty: UserTypeProjections::none(),
-            source_info,
-            internal: false,
-            local_info: LocalInfo::Other,
-            is_block_tail: None,
-        });
+        builder.local_decls.push(LocalDecl::with_source_info(ty, source_info));
     }
     builder.cfg.terminate(START_BLOCK, source_info, TerminatorKind::Unreachable);
     let mut body = builder.finish();
@@ -750,10 +761,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             guard_context: vec![],
             push_unsafe_count: 0,
             unpushed_unsafe: safety,
-            local_decls: IndexVec::from_elem_n(
-                LocalDecl::new_return_place(return_ty, return_span),
-                1,
-            ),
+            local_decls: IndexVec::from_elem_n(LocalDecl::new(return_ty, return_span), 1),
             canonical_user_type_annotations: IndexVec::new(),
             upvar_mutbls: vec![],
             var_indices: Default::default(),
@@ -789,7 +797,6 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             self.arg_count,
             self.var_debug_info,
             self.fn_span,
-            self.hir.control_flow_destroyed(),
             self.generator_kind,
         )
     }
@@ -804,19 +811,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     ) -> BlockAnd<()> {
         // Allocate locals for the function arguments
         for &ArgInfo(ty, _, arg_opt, _) in arguments.iter() {
-            let source_info = SourceInfo {
-                scope: OUTERMOST_SOURCE_SCOPE,
-                span: arg_opt.map_or(self.fn_span, |arg| arg.pat.span),
-            };
-            let arg_local = self.local_decls.push(LocalDecl {
-                mutability: Mutability::Mut,
-                ty,
-                user_ty: UserTypeProjections::none(),
-                source_info,
-                internal: false,
-                local_info: LocalInfo::Other,
-                is_block_tail: None,
-            });
+            let source_info =
+                SourceInfo::outermost(arg_opt.map_or(self.fn_span, |arg| arg.pat.span));
+            let arg_local = self.local_decls.push(LocalDecl::with_source_info(ty, source_info));
 
             // If this is a simple binding pattern, give debuginfo a nice name.
             if let Some(arg) = arg_opt {
@@ -832,14 +829,14 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
         let tcx = self.hir.tcx();
         let tcx_hir = tcx.hir();
-        let hir_tables = self.hir.tables();
+        let hir_typeck_results = self.hir.typeck_results();
 
         // In analyze_closure() in upvar.rs we gathered a list of upvars used by a
-        // closure and we stored in a map called upvar_list in TypeckTables indexed
+        // indexed closure and we stored in a map called closure_captures in TypeckResults
         // with the closure's DefId. Here, we run through that vec of UpvarIds for
         // the given closure and use the necessary information to create upvar
         // debuginfo and to fill `self.upvar_mutbls`.
-        if let Some(upvars) = hir_tables.upvar_list.get(&fn_def_id) {
+        if let Some(upvars) = hir_typeck_results.closure_captures.get(&fn_def_id) {
             let closure_env_arg = Local::new(1);
             let mut closure_env_projs = vec![];
             let mut closure_ty = self.local_decls[closure_env_arg].ty;
@@ -857,14 +854,16 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             self.upvar_mutbls = upvars_with_tys
                 .enumerate()
                 .map(|(i, ((&var_id, &upvar_id), ty))| {
-                    let capture = hir_tables.upvar_capture(upvar_id);
+                    let capture = hir_typeck_results.upvar_capture(upvar_id);
 
                     let mut mutability = Mutability::Not;
                     let mut name = kw::Invalid;
                     if let Some(Node::Binding(pat)) = tcx_hir.find(var_id) {
                         if let hir::PatKind::Binding(_, _, ident, _) = pat.kind {
                             name = ident.name;
-                            match hir_tables.extract_binding_mode(tcx.sess, pat.hir_id, pat.span) {
+                            match hir_typeck_results
+                                .extract_binding_mode(tcx.sess, pat.hir_id, pat.span)
+                            {
                                 Some(ty::BindByValue(hir::Mutability::Mut)) => {
                                     mutability = Mutability::Mut;
                                 }
@@ -885,10 +884,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
                     self.var_debug_info.push(VarDebugInfo {
                         name,
-                        source_info: SourceInfo {
-                            scope: OUTERMOST_SOURCE_SCOPE,
-                            span: tcx_hir.span(var_id),
-                        },
+                        source_info: SourceInfo::outermost(tcx_hir.span(var_id)),
                         place: Place {
                             local: closure_env_arg,
                             projection: tcx.intern_place_elems(&projs),
@@ -933,17 +929,19 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         self.local_decls[local].mutability = mutability;
                         self.local_decls[local].source_info.scope = self.source_scope;
                         self.local_decls[local].local_info = if let Some(kind) = self_binding {
-                            LocalInfo::User(ClearCrossCrate::Set(BindingForm::ImplicitSelf(*kind)))
+                            Some(box LocalInfo::User(ClearCrossCrate::Set(
+                                BindingForm::ImplicitSelf(*kind),
+                            )))
                         } else {
                             let binding_mode = ty::BindingMode::BindByValue(mutability);
-                            LocalInfo::User(ClearCrossCrate::Set(BindingForm::Var(
+                            Some(box LocalInfo::User(ClearCrossCrate::Set(BindingForm::Var(
                                 VarBindingForm {
                                     binding_mode,
                                     opt_ty_info,
                                     opt_match_place: Some((Some(place), span)),
                                     pat_span: span,
                                 },
-                            )))
+                            ))))
                         };
                         self.var_indices.insert(var, LocalsForNode::One(local));
                     }

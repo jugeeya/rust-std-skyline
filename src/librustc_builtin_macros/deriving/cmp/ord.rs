@@ -2,10 +2,10 @@ use crate::deriving::generic::ty::*;
 use crate::deriving::generic::*;
 use crate::deriving::path_std;
 
-use rustc_ast::ast::{self, Expr, MetaItem};
 use rustc_ast::ptr::P;
+use rustc_ast::{self as ast, Expr, MetaItem};
 use rustc_expand::base::{Annotatable, ExtCtxt};
-use rustc_span::symbol::sym;
+use rustc_span::symbol::{sym, Ident};
 use rustc_span::Span;
 
 pub fn expand_deriving_ord(
@@ -20,17 +20,17 @@ pub fn expand_deriving_ord(
     let trait_def = TraitDef {
         span,
         attributes: Vec::new(),
-        path: path_std!(cx, cmp::Ord),
+        path: path_std!(cmp::Ord),
         additional_bounds: Vec::new(),
-        generics: LifetimeBounds::empty(),
+        generics: Bounds::empty(),
         is_unsafe: false,
         supports_unions: false,
         methods: vec![MethodDef {
-            name: "cmp",
-            generics: LifetimeBounds::empty(),
+            name: sym::cmp,
+            generics: Bounds::empty(),
             explicit_self: borrowed_explicit_self(),
-            args: vec![(borrowed_self(), "other")],
-            ret_ty: Literal(path_std!(cx, cmp::Ordering)),
+            args: vec![(borrowed_self(), sym::other)],
+            ret_ty: Literal(path_std!(cmp::Ordering)),
             attributes: attrs,
             is_unsafe: false,
             unify_fieldless_variants: true,
@@ -45,15 +45,15 @@ pub fn expand_deriving_ord(
 pub fn ordering_collapsed(
     cx: &mut ExtCtxt<'_>,
     span: Span,
-    self_arg_tags: &[ast::Ident],
+    self_arg_tags: &[Ident],
 ) -> P<ast::Expr> {
     let lft = cx.expr_ident(span, self_arg_tags[0]);
     let rgt = cx.expr_addr_of(span, cx.expr_ident(span, self_arg_tags[1]));
-    cx.expr_method_call(span, lft, ast::Ident::new(sym::cmp, span), vec![rgt])
+    cx.expr_method_call(span, lft, Ident::new(sym::cmp, span), vec![rgt])
 }
 
 pub fn cs_cmp(cx: &mut ExtCtxt<'_>, span: Span, substr: &Substructure<'_>) -> P<Expr> {
-    let test_id = ast::Ident::new(sym::cmp, span);
+    let test_id = Ident::new(sym::cmp, span);
     let equals_path = cx.path_global(span, cx.std_path(&[sym::cmp, sym::Ordering, sym::Equal]));
 
     let cmp_path = cx.std_path(&[sym::cmp, sym::Ord, sym::cmp]);

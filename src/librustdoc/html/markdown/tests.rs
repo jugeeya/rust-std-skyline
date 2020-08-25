@@ -29,8 +29,8 @@ fn test_unique_id() {
         "examples-2",
         "method.into_iter-1",
         "foo-1",
-        "main",
-        "search",
+        "main-1",
+        "search-1",
         "methods",
         "examples-3",
         "method.into_iter-2",
@@ -64,7 +64,7 @@ fn test_lang_string_parse() {
         edition: Option<Edition>,
     ) {
         assert_eq!(
-            LangString::parse(s, ErrorCodes::Yes, true),
+            LangString::parse(s, ErrorCodes::Yes, true, None),
             LangString {
                 should_panic,
                 no_run,
@@ -134,7 +134,7 @@ fn test_header() {
     fn t(input: &str, expect: &str) {
         let mut map = IdMap::new();
         let output =
-            Markdown(input, &[], &mut map, ErrorCodes::Yes, DEFAULT_EDITION, &None).to_string();
+            Markdown(input, &[], &mut map, ErrorCodes::Yes, DEFAULT_EDITION, &None).into_string();
         assert_eq!(output, expect, "original: {}", input);
     }
 
@@ -166,7 +166,8 @@ fn test_header() {
 fn test_header_ids_multiple_blocks() {
     let mut map = IdMap::new();
     fn t(map: &mut IdMap, input: &str, expect: &str) {
-        let output = Markdown(input, &[], map, ErrorCodes::Yes, DEFAULT_EDITION, &None).to_string();
+        let output =
+            Markdown(input, &[], map, ErrorCodes::Yes, DEFAULT_EDITION, &None).into_string();
         assert_eq!(output, expect, "original: {}", input);
     }
 
@@ -191,8 +192,8 @@ fn test_header_ids_multiple_blocks() {
     t(
         &mut map,
         "# Main",
-        "<h1 id=\"main\" class=\"section-header\">\
-        <a href=\"#main\">Main</a></h1>",
+        "<h1 id=\"main-1\" class=\"section-header\">\
+        <a href=\"#main-1\">Main</a></h1>",
     );
     t(
         &mut map,
@@ -228,7 +229,7 @@ fn test_markdown_html_escape() {
     fn t(input: &str, expect: &str) {
         let mut idmap = IdMap::new();
         let output =
-            MarkdownHtml(input, &mut idmap, ErrorCodes::Yes, DEFAULT_EDITION, &None).to_string();
+            MarkdownHtml(input, &mut idmap, ErrorCodes::Yes, DEFAULT_EDITION, &None).into_string();
         assert_eq!(output, expect, "original: {}", input);
     }
 

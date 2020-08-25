@@ -1,8 +1,8 @@
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::FxIndexSet;
 use rustc_index::bit_set::{HybridBitSet, SparseBitMatrix};
 use rustc_index::vec::Idx;
 use rustc_index::vec::IndexVec;
-use rustc_middle::mir::{BasicBlock, Body, Location, ReadOnlyBodyAndCache};
+use rustc_middle::mir::{BasicBlock, Body, Location};
 use rustc_middle::ty::{self, RegionVid};
 use std::fmt::Debug;
 use std::rc::Rc;
@@ -80,7 +80,7 @@ impl RegionValueElements {
     /// Pushes all predecessors of `index` onto `stack`.
     crate fn push_predecessors(
         &self,
-        body: ReadOnlyBodyAndCache<'_, '_>,
+        body: &Body<'_>,
         index: PointIndex,
         stack: &mut Vec<PointIndex>,
     ) {
@@ -89,7 +89,7 @@ impl RegionValueElements {
             // If this is a basic block head, then the predecessors are
             // the terminators of other basic blocks
             stack.extend(
-                body.predecessors_for(block)
+                body.predecessors()[block]
                     .iter()
                     .map(|&pred_bb| body.terminator_loc(pred_bb))
                     .map(|pred_loc| self.point_from_location(pred_loc)),
@@ -193,26 +193,25 @@ impl<N: Idx> LivenessValues<N> {
 /// NLL.
 #[derive(Default)]
 crate struct PlaceholderIndices {
-    to_index: FxHashMap<ty::PlaceholderRegion, PlaceholderIndex>,
-    from_index: IndexVec<PlaceholderIndex, ty::PlaceholderRegion>,
+    indices: FxIndexSet<ty::PlaceholderRegion>,
 }
 
 impl PlaceholderIndices {
     crate fn insert(&mut self, placeholder: ty::PlaceholderRegion) -> PlaceholderIndex {
-        let PlaceholderIndices { to_index, from_index } = self;
-        *to_index.entry(placeholder).or_insert_with(|| from_index.push(placeholder))
+        let (index, _) = self.indices.insert_full(placeholder);
+        index.into()
     }
 
     crate fn lookup_index(&self, placeholder: ty::PlaceholderRegion) -> PlaceholderIndex {
-        self.to_index[&placeholder]
+        self.indices.get_index_of(&placeholder).unwrap().into()
     }
 
     crate fn lookup_placeholder(&self, placeholder: PlaceholderIndex) -> ty::PlaceholderRegion {
-        self.from_index[placeholder]
+        self.indices[placeholder.index()]
     }
 
     crate fn len(&self) -> usize {
-        self.from_index.len()
+        self.indices.len()
     }
 }
 

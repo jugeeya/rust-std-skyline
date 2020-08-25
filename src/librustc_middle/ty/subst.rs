@@ -1,13 +1,14 @@
 // Type substitutions.
 
 use crate::infer::canonical::Canonical;
+use crate::ty::codec::{TyDecoder, TyEncoder};
 use crate::ty::fold::{TypeFoldable, TypeFolder, TypeVisitor};
 use crate::ty::sty::{ClosureSubsts, GeneratorSubsts};
 use crate::ty::{self, Lift, List, ParamConst, Ty, TyCtxt};
 
 use rustc_hir::def_id::DefId;
 use rustc_macros::HashStable;
-use rustc_serialize::{self, Decodable, Decoder, Encodable, Encoder};
+use rustc_serialize::{self, Decodable, Encodable};
 use rustc_span::{Span, DUMMY_SP};
 use smallvec::SmallVec;
 
@@ -34,7 +35,7 @@ const TYPE_TAG: usize = 0b00;
 const REGION_TAG: usize = 0b01;
 const CONST_TAG: usize = 0b10;
 
-#[derive(Debug, RustcEncodable, RustcDecodable, PartialEq, Eq, PartialOrd, Ord, HashStable)]
+#[derive(Debug, TyEncodable, TyDecodable, PartialEq, Eq, PartialOrd, Ord, HashStable)]
 pub enum GenericArgKind<'tcx> {
     Lifetime(ty::Region<'tcx>),
     Type(Ty<'tcx>),
@@ -168,14 +169,14 @@ impl<'tcx> TypeFoldable<'tcx> for GenericArg<'tcx> {
     }
 }
 
-impl<'tcx> Encodable for GenericArg<'tcx> {
-    fn encode<E: Encoder>(&self, e: &mut E) -> Result<(), E::Error> {
+impl<'tcx, E: TyEncoder<'tcx>> Encodable<E> for GenericArg<'tcx> {
+    fn encode(&self, e: &mut E) -> Result<(), E::Error> {
         self.unpack().encode(e)
     }
 }
 
-impl<'tcx> Decodable for GenericArg<'tcx> {
-    fn decode<D: Decoder>(d: &mut D) -> Result<GenericArg<'tcx>, D::Error> {
+impl<'tcx, D: TyDecoder<'tcx>> Decodable<D> for GenericArg<'tcx> {
+    fn decode(d: &mut D) -> Result<GenericArg<'tcx>, D::Error> {
         Ok(GenericArgKind::decode(d)?.pack())
     }
 }
@@ -205,38 +206,6 @@ impl<'a, 'tcx> InternalSubsts<'tcx> {
     /// Creates a `InternalSubsts` that maps each generic parameter to itself.
     pub fn identity_for_item(tcx: TyCtxt<'tcx>, def_id: DefId) -> SubstsRef<'tcx> {
         Self::for_item(tcx, def_id, |param, _| tcx.mk_param_from_def(param))
-    }
-
-    /// Creates a `InternalSubsts` that maps each generic parameter to a higher-ranked
-    /// var bound at index `0`. For types, we use a `BoundVar` index equal to
-    /// the type parameter index. For regions, we use the `BoundRegion::BrNamed`
-    /// variant (which has a `DefId`).
-    pub fn bound_vars_for_item(tcx: TyCtxt<'tcx>, def_id: DefId) -> SubstsRef<'tcx> {
-        Self::for_item(tcx, def_id, |param, _| match param.kind {
-            ty::GenericParamDefKind::Type { .. } => tcx
-                .mk_ty(ty::Bound(
-                    ty::INNERMOST,
-                    ty::BoundTy {
-                        var: ty::BoundVar::from(param.index),
-                        kind: ty::BoundTyKind::Param(param.name),
-                    },
-                ))
-                .into(),
-
-            ty::GenericParamDefKind::Lifetime => tcx
-                .mk_region(ty::RegionKind::ReLateBound(
-                    ty::INNERMOST,
-                    ty::BoundRegion::BrNamed(param.def_id, param.name),
-                ))
-                .into(),
-
-            ty::GenericParamDefKind::Const => tcx
-                .mk_const(ty::Const {
-                    val: ty::ConstKind::Bound(ty::INNERMOST, ty::BoundVar::from(param.index)),
-                    ty: tcx.type_of(param.def_id),
-                })
-                .into(),
-        })
     }
 
     /// Creates a `InternalSubsts` for generic parameter definitions,
@@ -365,6 +334,19 @@ impl<'a, 'tcx> InternalSubsts<'tcx> {
     /// in a different item, with `target_substs` as the base for
     /// the target impl/trait, with the source child-specific
     /// parameters (e.g., method parameters) on top of that base.
+    ///
+    /// For example given:
+    ///
+    /// ```no_run
+    /// trait X<S> { fn f<T>(); }
+    /// impl<U> X<U> for U { fn f<V>() {} }
+    /// ```
+    ///
+    /// * If `self` is `[Self, S, T]`: the identity substs of `f` in the trait.
+    /// * If `source_ancestor` is the def_id of the trait.
+    /// * If `target_substs` is `[U]`, the substs for the impl.
+    /// * Then we will return `[U, T]`, the subst for `f` in the impl that
+    ///   are needed for it to match the trait.
     pub fn rebase_onto(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -372,11 +354,11 @@ impl<'a, 'tcx> InternalSubsts<'tcx> {
         target_substs: SubstsRef<'tcx>,
     ) -> SubstsRef<'tcx> {
         let defs = tcx.generics_of(source_ancestor);
-        tcx.mk_substs(target_substs.iter().chain(&self[defs.params.len()..]).cloned())
+        tcx.mk_substs(target_substs.iter().chain(self.iter().skip(defs.params.len())))
     }
 
     pub fn truncate_to(&self, tcx: TyCtxt<'tcx>, generics: &ty::Generics) -> SubstsRef<'tcx> {
-        tcx.mk_substs(self.iter().take(generics.count()).cloned())
+        tcx.mk_substs(self.iter().take(generics.count()))
     }
 }
 
@@ -415,8 +397,6 @@ impl<'tcx> TypeFoldable<'tcx> for SubstsRef<'tcx> {
     }
 }
 
-impl<'tcx> rustc_serialize::UseSpecializedDecodable for SubstsRef<'tcx> {}
-
 ///////////////////////////////////////////////////////////////////////////
 // Public trait `Subst`
 //
@@ -444,8 +424,7 @@ impl<'tcx, T: TypeFoldable<'tcx>> Subst<'tcx> for T {
         substs: &[GenericArg<'tcx>],
         span: Option<Span>,
     ) -> T {
-        let mut folder =
-            SubstFolder { tcx, substs, span, root_ty: None, ty_stack_depth: 0, binders_passed: 0 };
+        let mut folder = SubstFolder { tcx, substs, span, binders_passed: 0 };
         (*self).fold_with(&mut folder)
     }
 }
@@ -459,12 +438,6 @@ struct SubstFolder<'a, 'tcx> {
 
     /// The location for which the substitution is performed, if available.
     span: Option<Span>,
-
-    /// The root type that is being substituted, if available.
-    root_ty: Option<Ty<'tcx>>,
-
-    /// Depth of type stack
-    ty_stack_depth: usize,
 
     /// Number of region binders we have passed through while doing the substitution
     binders_passed: u32,
@@ -497,9 +470,8 @@ impl<'a, 'tcx> TypeFolder<'tcx> for SubstFolder<'a, 'tcx> {
                         let span = self.span.unwrap_or(DUMMY_SP);
                         let msg = format!(
                             "Region parameter out of range \
-                             when substituting in region {} (root type={:?}) \
-                             (index={})",
-                            data.name, self.root_ty, data.index
+                             when substituting in region {} (index={})",
+                            data.name, data.index
                         );
                         span_bug!(span, "{}", msg);
                     }
@@ -514,25 +486,10 @@ impl<'a, 'tcx> TypeFolder<'tcx> for SubstFolder<'a, 'tcx> {
             return t;
         }
 
-        // track the root type we were asked to substitute
-        let depth = self.ty_stack_depth;
-        if depth == 0 {
-            self.root_ty = Some(t);
-        }
-        self.ty_stack_depth += 1;
-
-        let t1 = match t.kind {
+        match t.kind {
             ty::Param(p) => self.ty_for_param(p, t),
             _ => t.super_fold_with(self),
-        };
-
-        assert_eq!(depth + 1, self.ty_stack_depth);
-        self.ty_stack_depth -= 1;
-        if depth == 0 {
-            self.root_ty = None;
         }
-
-        t1
     }
 
     fn fold_const(&mut self, c: &'tcx ty::Const<'tcx>) -> &'tcx ty::Const<'tcx> {
@@ -559,12 +516,11 @@ impl<'a, 'tcx> SubstFolder<'a, 'tcx> {
                 span_bug!(
                     span,
                     "expected type for `{:?}` ({:?}/{}) but found {:?} \
-                     when substituting (root type={:?}) substs={:?}",
+                     when substituting, substs={:?}",
                     p,
                     source_ty,
                     p.index,
                     kind,
-                    self.root_ty,
                     self.substs,
                 );
             }
@@ -573,11 +529,10 @@ impl<'a, 'tcx> SubstFolder<'a, 'tcx> {
                 span_bug!(
                     span,
                     "type parameter `{:?}` ({:?}/{}) out of range \
-                     when substituting (root type={:?}) substs={:?}",
+                     when substituting, substs={:?}",
                     p,
                     source_ty,
                     p.index,
-                    self.root_ty,
                     self.substs,
                 );
             }
@@ -631,12 +586,12 @@ impl<'a, 'tcx> SubstFolder<'a, 'tcx> {
     ///
     /// ```
     /// type Func<A> = fn(A);
-    /// type MetaFunc = for<'a> fn(Func<&'a int>)
+    /// type MetaFunc = for<'a> fn(Func<&'a i32>)
     /// ```
     ///
     /// The type `MetaFunc`, when fully expanded, will be
     ///
-    ///     for<'a> fn(fn(&'a int))
+    ///     for<'a> fn(fn(&'a i32))
     ///             ^~ ^~ ^~~
     ///             |  |  |
     ///             |  |  DebruijnIndex of 2
@@ -645,7 +600,7 @@ impl<'a, 'tcx> SubstFolder<'a, 'tcx> {
     /// Here the `'a` lifetime is bound in the outer function, but appears as an argument of the
     /// inner one. Therefore, that appearance will have a DebruijnIndex of 2, because we must skip
     /// over the inner binder (remember that we count De Bruijn indices from 1). However, in the
-    /// definition of `MetaFunc`, the binder is not visible, so the type `&'a int` will have a
+    /// definition of `MetaFunc`, the binder is not visible, so the type `&'a i32` will have a
     /// De Bruijn index of 1. It's only during the substitution that we can see we must increase the
     /// depth by 1 to account for the binder that we passed through.
     ///
@@ -653,18 +608,18 @@ impl<'a, 'tcx> SubstFolder<'a, 'tcx> {
     ///
     /// ```
     /// type FuncTuple<A> = (A,fn(A));
-    /// type MetaFuncTuple = for<'a> fn(FuncTuple<&'a int>)
+    /// type MetaFuncTuple = for<'a> fn(FuncTuple<&'a i32>)
     /// ```
     ///
     /// Here the final type will be:
     ///
-    ///     for<'a> fn((&'a int, fn(&'a int)))
+    ///     for<'a> fn((&'a i32, fn(&'a i32)))
     ///                 ^~~         ^~~
     ///                 |           |
     ///          DebruijnIndex of 1 |
     ///                      DebruijnIndex of 2
     ///
-    /// As indicated in the diagram, here the same type `&'a int` is substituted once, but in the
+    /// As indicated in the diagram, here the same type `&'a i32` is substituted once, but in the
     /// first case we do not increase the De Bruijn index and in the second case we do. The reason
     /// is that only in the second case have we passed through a fn binder.
     fn shift_vars_through_binders<T: TypeFoldable<'tcx>>(&self, val: T) -> T {
@@ -697,7 +652,7 @@ pub type CanonicalUserSubsts<'tcx> = Canonical<'tcx, UserSubsts<'tcx>>;
 
 /// Stores the user-given substs to reach some fully qualified path
 /// (e.g., `<T>::Item` or `<T as Trait>::Item`).
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, RustcEncodable, RustcDecodable)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, TyEncodable, TyDecodable)]
 #[derive(HashStable, TypeFoldable, Lift)]
 pub struct UserSubsts<'tcx> {
     /// The substitutions for the item as given by the user.
@@ -724,7 +679,7 @@ pub struct UserSubsts<'tcx> {
 /// the impl (with the substs from `UserSubsts`) and apply those to
 /// the self type, giving `Foo<?A>`. Finally, we unify that with
 /// the self type here, which contains `?A` to be `&'static u32`
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, RustcEncodable, RustcDecodable)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, TyEncodable, TyDecodable)]
 #[derive(HashStable, TypeFoldable, Lift)]
 pub struct UserSelfTy<'tcx> {
     pub impl_def_id: DefId,

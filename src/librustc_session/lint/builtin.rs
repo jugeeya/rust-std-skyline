@@ -7,6 +7,7 @@
 use crate::lint::FutureIncompatibleInfo;
 use crate::{declare_lint, declare_lint_pass};
 use rustc_span::edition::Edition;
+use rustc_span::symbol::sym;
 
 declare_lint! {
     pub ILL_FORMED_ATTRIBUTE_INPUT,
@@ -16,6 +17,7 @@ declare_lint! {
         reference: "issue #57571 <https://github.com/rust-lang/rust/issues/57571>",
         edition: None,
     };
+    crate_level_only
 }
 
 declare_lint! {
@@ -69,6 +71,13 @@ declare_lint! {
     pub UNUSED_EXTERN_CRATES,
     Allow,
     "extern crates that are never used"
+}
+
+declare_lint! {
+    pub UNUSED_CRATE_DEPENDENCIES,
+    Allow,
+    "crate dependencies that are never used",
+    crate_level_only
 }
 
 declare_lint! {
@@ -159,7 +168,8 @@ declare_lint! {
 declare_lint! {
     pub UNKNOWN_CRATE_TYPES,
     Deny,
-    "unknown crate type found in `#[crate_type]` directive"
+    "unknown crate type found in `#[crate_type]` directive",
+    crate_level_only
 }
 
 declare_lint! {
@@ -217,9 +227,15 @@ declare_lint! {
 }
 
 declare_lint! {
+    pub UNALIGNED_REFERENCES,
+    Allow,
+    "detects unaligned references to fields of packed structs",
+}
+
+declare_lint! {
     pub SAFE_PACKED_BORROWS,
     Warn,
-    "safe borrows of fields of packed structs were was erroneously allowed",
+    "safe borrows of fields of packed structs were erroneously allowed",
     @future_incompatible = FutureIncompatibleInfo {
         reference: "issue #46043 <https://github.com/rust-lang/rust/issues/46043>",
         edition: None,
@@ -232,16 +248,6 @@ declare_lint! {
     "patterns in functions without body were erroneously allowed",
     @future_incompatible = FutureIncompatibleInfo {
         reference: "issue #35203 <https://github.com/rust-lang/rust/issues/35203>",
-        edition: None,
-    };
-}
-
-declare_lint! {
-    pub MISSING_FRAGMENT_SPECIFIER,
-    Deny,
-    "detects missing fragment specifiers in unused `macro_rules!` patterns",
-    @future_incompatible = FutureIncompatibleInfo {
-        reference: "issue #40107 <https://github.com/rust-lang/rust/issues/40107>",
         edition: None,
     };
 }
@@ -326,7 +332,8 @@ declare_lint! {
 declare_lint! {
     pub ELIDED_LIFETIMES_IN_PATHS,
     Allow,
-    "hidden lifetime parameters in types are deprecated"
+    "hidden lifetime parameters in types are deprecated",
+    crate_level_only
 }
 
 declare_lint! {
@@ -381,9 +388,15 @@ declare_lint! {
 }
 
 declare_lint! {
-    pub INTRA_DOC_LINK_RESOLUTION_FAILURE,
+    pub BROKEN_INTRA_DOC_LINKS,
     Warn,
     "failures in resolving intra-doc link targets"
+}
+
+declare_lint! {
+    pub INVALID_CODEBLOCK_ATTRIBUTES,
+    Warn,
+    "codeblock attribute looks a lot like a known one"
 }
 
 declare_lint! {
@@ -440,6 +453,7 @@ declare_lint! {
         reference: "issue #52234 <https://github.com/rust-lang/rust/issues/52234>",
         edition: None,
     };
+    crate_level_only
 }
 
 declare_lint! {
@@ -502,6 +516,29 @@ declare_lint! {
     "detects incompatible use of `#[inline(always)]` and `#[no_sanitize(...)]`",
 }
 
+declare_lint! {
+    pub ASM_SUB_REGISTER,
+    Warn,
+    "using only a subset of a register for inline asm inputs",
+}
+
+declare_lint! {
+    pub UNSAFE_OP_IN_UNSAFE_FN,
+    Allow,
+    "unsafe operations in unsafe functions without an explicit unsafe block are deprecated",
+    @feature_gate = sym::unsafe_block_in_unsafe_fn;
+}
+
+declare_lint! {
+    pub CENUM_IMPL_DROP_CAST,
+    Warn,
+    "a C-like enum implementing Drop is cast",
+    @future_incompatible = FutureIncompatibleInfo {
+        reference: "issue #73333 <https://github.com/rust-lang/rust/issues/73333>",
+        edition: None,
+    };
+}
+
 declare_lint_pass! {
     /// Does nothing as a lint pass, but registers some `Lint`s
     /// that are used by other parts of the compiler.
@@ -511,6 +548,7 @@ declare_lint_pass! {
         UNCONDITIONAL_PANIC,
         UNUSED_IMPORTS,
         UNUSED_EXTERN_CRATES,
+        UNUSED_CRATE_DEPENDENCIES,
         UNUSED_QUALIFICATIONS,
         UNKNOWN_LINTS,
         UNUSED_VARIABLES,
@@ -533,9 +571,9 @@ declare_lint_pass! {
         INVALID_TYPE_PARAM_DEFAULT,
         CONST_ERR,
         RENAMED_AND_REMOVED_LINTS,
+        UNALIGNED_REFERENCES,
         SAFE_PACKED_BORROWS,
         PATTERNS_IN_FNS_WITHOUT_BODY,
-        MISSING_FRAGMENT_SPECIFIER,
         LATE_BOUND_LIFETIME_ARGUMENTS,
         ORDER_DEPENDENT_TRAIT_OBJECTS,
         COHERENCE_LEAK_CHECK,
@@ -552,7 +590,8 @@ declare_lint_pass! {
         ABSOLUTE_PATHS_NOT_STARTING_WITH_CRATE,
         UNSTABLE_NAME_COLLISIONS,
         IRREFUTABLE_LET_PATTERNS,
-        INTRA_DOC_LINK_RESOLUTION_FAILURE,
+        BROKEN_INTRA_DOC_LINKS,
+        INVALID_CODEBLOCK_ATTRIBUTES,
         MISSING_CRATE_LEVEL_DOCS,
         MISSING_DOC_CODE_EXAMPLES,
         PRIVATE_DOC_TESTS,
@@ -569,6 +608,10 @@ declare_lint_pass! {
         INDIRECT_STRUCTURAL_MATCH,
         SOFT_UNSTABLE,
         INLINE_NO_SANITIZE,
+        ASM_SUB_REGISTER,
+        UNSAFE_OP_IN_UNSAFE_FN,
+        INCOMPLETE_INCLUDE,
+        CENUM_IMPL_DROP_CAST,
     ]
 }
 

@@ -1,5 +1,5 @@
 #![feature(const_generics)]
-//~^ WARN the feature `const_generics` is incomplete and may cause the compiler to crash
+#![allow(incomplete_features)]
 
 type Array<T, const N: usize> = [T; N];
 

@@ -1,10 +1,11 @@
 use crate::base::ExtCtxt;
 use crate::expand::{AstFragment, AstFragmentKind};
 
-use rustc_ast::ast;
+use rustc_ast as ast;
 use rustc_ast::mut_visit::*;
 use rustc_ast::ptr::P;
 use rustc_span::source_map::{dummy_spanned, DUMMY_SP};
+use rustc_span::symbol::Ident;
 
 use smallvec::{smallvec, SmallVec};
 
@@ -23,7 +24,7 @@ pub fn placeholder(
         }
     }
 
-    let ident = ast::Ident::invalid();
+    let ident = Ident::invalid();
     let attrs = Vec::new();
     let vis = vis.unwrap_or_else(|| dummy_spanned(ast::VisibilityKind::Inherited));
     let span = DUMMY_SP;
@@ -33,10 +34,12 @@ pub fn placeholder(
             span,
             attrs: ast::AttrVec::new(),
             kind: ast::ExprKind::MacCall(mac_placeholder()),
+            tokens: None,
         })
     };
     let ty = || P(ast::Ty { id, kind: ast::TyKind::MacCall(mac_placeholder()), span });
-    let pat = || P(ast::Pat { id, kind: ast::PatKind::MacCall(mac_placeholder()), span });
+    let pat =
+        || P(ast::Pat { id, kind: ast::PatKind::MacCall(mac_placeholder()), span, tokens: None });
 
     match kind {
         AstFragmentKind::Expr => AstFragment::Expr(expr_placeholder()),
@@ -83,6 +86,7 @@ pub fn placeholder(
             id,
             span,
             kind: ast::PatKind::MacCall(mac_placeholder()),
+            tokens: None,
         })),
         AstFragmentKind::Ty => {
             AstFragment::Ty(P(ast::Ty { id, span, kind: ast::TyKind::MacCall(mac_placeholder()) }))

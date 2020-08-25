@@ -1,9 +1,8 @@
 use crate::deriving::generic::ty::*;
 use crate::deriving::generic::*;
-use crate::deriving::path_std;
 
-use rustc_ast::ast::{Expr, MetaItem};
 use rustc_ast::ptr::P;
+use rustc_ast::{Expr, MetaItem};
 use rustc_errors::struct_span_err;
 use rustc_expand::base::{Annotatable, DummyResult, ExtCtxt};
 use rustc_span::symbol::{kw, sym};
@@ -21,14 +20,14 @@ pub fn expand_deriving_default(
     let trait_def = TraitDef {
         span,
         attributes: Vec::new(),
-        path: path_std!(cx, default::Default),
+        path: Path::new(vec![kw::Default, sym::Default]),
         additional_bounds: Vec::new(),
-        generics: LifetimeBounds::empty(),
+        generics: Bounds::empty(),
         is_unsafe: false,
         supports_unions: false,
         methods: vec![MethodDef {
-            name: "default",
-            generics: LifetimeBounds::empty(),
+            name: kw::Default,
+            generics: Bounds::empty(),
             explicit_self: None,
             args: Vec::new(),
             ret_ty: Self_,
@@ -73,7 +72,7 @@ fn default_substructure(
         },
         StaticEnum(..) => {
             struct_span_err!(
-                cx.parse_sess.span_diagnostic,
+                &cx.sess.parse_sess.span_diagnostic,
                 trait_span,
                 E0665,
                 "`Default` cannot be derived for enums, only structs"

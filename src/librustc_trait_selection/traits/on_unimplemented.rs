@@ -1,11 +1,10 @@
-use fmt_macros::{Parser, Piece, Position};
-
-use rustc_ast::ast::{MetaItem, NestedMetaItem};
+use rustc_ast::{MetaItem, NestedMetaItem};
 use rustc_attr as attr;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_errors::{struct_span_err, ErrorReported};
 use rustc_hir::def_id::DefId;
 use rustc_middle::ty::{self, GenericParamDefKind, TyCtxt};
+use rustc_parse_format::{ParseMode, Parser, Piece, Position};
 use rustc_span::symbol::{kw, sym, Symbol};
 use rustc_span::Span;
 
@@ -81,7 +80,7 @@ impl<'tcx> OnUnimplementedDirective {
                         None,
                     )
                 })?;
-            attr::eval_condition(cond, &tcx.sess.parse_sess, &mut |_| true);
+            attr::eval_condition(cond, &tcx.sess.parse_sess, Some(tcx.features()), &mut |_| true);
             Some(cond.clone())
         };
 
@@ -96,27 +95,27 @@ impl<'tcx> OnUnimplementedDirective {
         };
 
         for item in item_iter {
-            if item.check_name(sym::message) && message.is_none() {
+            if item.has_name(sym::message) && message.is_none() {
                 if let Some(message_) = item.value_str() {
                     message = parse_value(message_)?;
                     continue;
                 }
-            } else if item.check_name(sym::label) && label.is_none() {
+            } else if item.has_name(sym::label) && label.is_none() {
                 if let Some(label_) = item.value_str() {
                     label = parse_value(label_)?;
                     continue;
                 }
-            } else if item.check_name(sym::note) && note.is_none() {
+            } else if item.has_name(sym::note) && note.is_none() {
                 if let Some(note_) = item.value_str() {
                     note = parse_value(note_)?;
                     continue;
                 }
-            } else if item.check_name(sym::enclosing_scope) && enclosing_scope.is_none() {
+            } else if item.has_name(sym::enclosing_scope) && enclosing_scope.is_none() {
                 if let Some(enclosing_scope_) = item.value_str() {
                     enclosing_scope = parse_value(enclosing_scope_)?;
                     continue;
                 }
-            } else if item.check_name(sym::on)
+            } else if item.has_name(sym::on)
                 && is_root
                 && message.is_none()
                 && label.is_none()
@@ -165,7 +164,7 @@ impl<'tcx> OnUnimplementedDirective {
     ) -> Result<Option<Self>, ErrorReported> {
         let attrs = tcx.get_attrs(impl_def_id);
 
-        let attr = if let Some(item) = attr::find_by_name(&attrs, sym::rustc_on_unimplemented) {
+        let attr = if let Some(item) = tcx.sess.find_by_name(&attrs, sym::rustc_on_unimplemented) {
             item
         } else {
             return Ok(None);
@@ -208,11 +207,16 @@ impl<'tcx> OnUnimplementedDirective {
 
         for command in self.subcommands.iter().chain(Some(self)).rev() {
             if let Some(ref condition) = command.condition {
-                if !attr::eval_condition(condition, &tcx.sess.parse_sess, &mut |c| {
-                    c.ident().map_or(false, |ident| {
-                        options.contains(&(ident.name, c.value_str().map(|s| s.to_string())))
-                    })
-                }) {
+                if !attr::eval_condition(
+                    condition,
+                    &tcx.sess.parse_sess,
+                    Some(tcx.features()),
+                    &mut |c| {
+                        c.ident().map_or(false, |ident| {
+                            options.contains(&(ident.name, c.value_str().map(|s| s.to_string())))
+                        })
+                    },
+                ) {
                     debug!("evaluate: skipping {:?} due to condition", command);
                     continue;
                 }
@@ -267,7 +271,7 @@ impl<'tcx> OnUnimplementedFormatString {
         let name = tcx.item_name(trait_def_id);
         let generics = tcx.generics_of(trait_def_id);
         let s = self.0.as_str();
-        let parser = Parser::new(&s, None, vec![], false);
+        let parser = Parser::new(&s, None, None, false, ParseMode::Format);
         let mut result = Ok(());
         for token in parser {
             match token {
@@ -282,7 +286,7 @@ impl<'tcx> OnUnimplementedFormatString {
                     // `{from_desugaring}` is allowed
                     Position::ArgumentNamed(s) if s == sym::from_desugaring => (),
                     // `{ItemContext}` is allowed
-                    Position::ArgumentNamed(s) if s == sym::item_context => (),
+                    Position::ArgumentNamed(s) if s == sym::ItemContext => (),
                     // So is `{A}` if A is a type parameter
                     Position::ArgumentNamed(s) => {
                         match generics.params.iter().find(|param| param.name == s) {
@@ -345,8 +349,8 @@ impl<'tcx> OnUnimplementedFormatString {
         let empty_string = String::new();
 
         let s = self.0.as_str();
-        let parser = Parser::new(&s, None, vec![], false);
-        let item_context = (options.get(&sym::item_context)).unwrap_or(&empty_string);
+        let parser = Parser::new(&s, None, None, false, ParseMode::Format);
+        let item_context = (options.get(&sym::ItemContext)).unwrap_or(&empty_string);
         parser
             .map(|p| match p {
                 Piece::String(s) => s,
@@ -360,7 +364,7 @@ impl<'tcx> OnUnimplementedFormatString {
                             } else if s == sym::from_desugaring || s == sym::from_method {
                                 // don't break messages using these two arguments incorrectly
                                 &empty_string
-                            } else if s == sym::item_context {
+                            } else if s == sym::ItemContext {
                                 &item_context
                             } else {
                                 bug!(

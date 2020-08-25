@@ -4,25 +4,25 @@ use super::{FollowedByType, Parser, PathStyle};
 
 use crate::maybe_whole;
 
-use rustc_ast::ast::{self, AttrStyle, AttrVec, Attribute, Ident, DUMMY_NODE_ID};
-use rustc_ast::ast::{AssocItem, AssocItemKind, ForeignItemKind, Item, ItemKind, Mod};
-use rustc_ast::ast::{Async, Const, Defaultness, IsAuto, Mutability, Unsafe, UseTree, UseTreeKind};
-use rustc_ast::ast::{BindingMode, Block, FnDecl, FnSig, Param, SelfKind};
-use rustc_ast::ast::{EnumDef, Generics, StructField, TraitRef, Ty, TyKind, Variant, VariantData};
-use rustc_ast::ast::{FnHeader, ForeignItem, PathSegment, Visibility, VisibilityKind};
-use rustc_ast::ast::{MacArgs, MacCall, MacDelimiter};
 use rustc_ast::ptr::P;
 use rustc_ast::token::{self, TokenKind};
 use rustc_ast::tokenstream::{DelimSpan, TokenStream, TokenTree};
+use rustc_ast::{self as ast, AttrStyle, AttrVec, Attribute, DUMMY_NODE_ID};
+use rustc_ast::{AssocItem, AssocItemKind, ForeignItemKind, Item, ItemKind, Mod};
+use rustc_ast::{Async, Const, Defaultness, IsAuto, Mutability, Unsafe, UseTree, UseTreeKind};
+use rustc_ast::{BindingMode, Block, FnDecl, FnSig, Param, SelfKind};
+use rustc_ast::{EnumDef, Generics, StructField, TraitRef, Ty, TyKind, Variant, VariantData};
+use rustc_ast::{FnHeader, ForeignItem, Path, PathSegment, Visibility, VisibilityKind};
+use rustc_ast::{MacArgs, MacCall, MacDelimiter};
 use rustc_ast_pretty::pprust;
 use rustc_errors::{struct_span_err, Applicability, PResult, StashKey};
 use rustc_span::edition::Edition;
 use rustc_span::source_map::{self, Span};
-use rustc_span::symbol::{kw, sym, Symbol};
+use rustc_span::symbol::{kw, sym, Ident, Symbol};
 
-use log::debug;
 use std::convert::TryFrom;
 use std::mem;
+use tracing::debug;
 
 impl<'a> Parser<'a> {
     /// Parses a source module as a crate. This is the main entry point for the parser.
@@ -106,11 +106,20 @@ impl<'a> Parser<'a> {
         });
 
         let mut unclosed_delims = vec![];
-        let (mut item, tokens) = self.collect_tokens(|this| {
+        let has_attrs = !attrs.is_empty();
+        let parse_item = |this: &mut Self| {
             let item = this.parse_item_common_(attrs, mac_allowed, attrs_allowed, req_name);
             unclosed_delims.append(&mut this.unclosed_delims);
             item
-        })?;
+        };
+
+        let (mut item, tokens) = if has_attrs {
+            let (item, tokens) = self.collect_tokens(parse_item)?;
+            (item, Some(tokens))
+        } else {
+            (parse_item(self)?, None)
+        };
+
         self.unclosed_delims.append(&mut unclosed_delims);
 
         // Once we've parsed an item and recorded the tokens we got while
@@ -127,9 +136,11 @@ impl<'a> Parser<'a> {
         // it (bad!). To work around this case for now we just avoid recording
         // `tokens` if we detect any inner attributes. This should help keep
         // expansion correct, but we should fix this bug one day!
-        if let Some(item) = &mut item {
-            if !item.attrs.iter().any(|attr| attr.style == AttrStyle::Inner) {
-                item.tokens = Some(tokens);
+        if let Some(tokens) = tokens {
+            if let Some(item) = &mut item {
+                if !item.attrs.iter().any(|attr| attr.style == AttrStyle::Inner) {
+                    item.tokens = Some(tokens);
+                }
             }
         }
         Ok(item)
@@ -216,7 +227,7 @@ impl<'a> Parser<'a> {
             (Ident::invalid(), ItemKind::Use(P(tree)))
         } else if self.check_fn_front_matter() {
             // FUNCTION ITEM
-            let (ident, sig, generics, body) = self.parse_fn(attrs, req_name)?;
+            let (ident, sig, generics, body) = self.parse_fn(attrs, req_name, lo)?;
             (ident, ItemKind::Fn(def(), sig, generics, body))
         } else if self.eat_keyword(kw::Extern) {
             if self.eat_keyword(kw::Crate) {
@@ -599,7 +610,7 @@ impl<'a> Parser<'a> {
 
     /// Recover on a doc comment before `}`.
     fn recover_doc_comment_before_brace(&mut self) -> bool {
-        if let token::DocComment(_) = self.token.kind {
+        if let token::DocComment(..) = self.token.kind {
             if self.look_ahead(1, |tok| tok == &token::CloseDelim(token::Brace)) {
                 struct_span_err!(
                     self.diagnostic(),
@@ -743,7 +754,7 @@ impl<'a> Parser<'a> {
 
     /// Parses a `UseTree`.
     ///
-    /// ```
+    /// ```text
     /// USE_TREE = [`::`] `*` |
     ///            [`::`] `{` USE_TREE_LIST `}` |
     ///            PATH `::` `*` |
@@ -792,7 +803,7 @@ impl<'a> Parser<'a> {
 
     /// Parses a `UseTreeKind::Nested(list)`.
     ///
-    /// ```
+    /// ```text
     /// USE_TREE_LIST = Ø | (USE_TREE `,`)* USE_TREE [`,`]
     /// ```
     fn parse_use_tree_list(&mut self) -> PResult<'a, Vec<(UseTree, ast::NodeId)>> {
@@ -804,7 +815,7 @@ impl<'a> Parser<'a> {
         if self.eat_keyword(kw::As) { self.parse_ident_or_underscore().map(Some) } else { Ok(None) }
     }
 
-    fn parse_ident_or_underscore(&mut self) -> PResult<'a, ast::Ident> {
+    fn parse_ident_or_underscore(&mut self) -> PResult<'a, Ident> {
         match self.token.ident() {
             Some((ident @ Ident { name: kw::Underscore, .. }, false)) => {
                 self.bump();
@@ -834,7 +845,7 @@ impl<'a> Parser<'a> {
         Ok((item_name, ItemKind::ExternCrate(orig_name)))
     }
 
-    fn parse_crate_name_with_dashes(&mut self) -> PResult<'a, ast::Ident> {
+    fn parse_crate_name_with_dashes(&mut self) -> PResult<'a, Ident> {
         let error_msg = "crate name using dashes are not valid in `extern crate` statements";
         let suggestion_msg = "if the original crate name uses dashes you need to use underscores \
                               in the code";
@@ -1220,7 +1231,7 @@ impl<'a> Parser<'a> {
                 self.bump();
             }
             token::CloseDelim(token::Brace) => {}
-            token::DocComment(_) => {
+            token::DocComment(..) => {
                 let previous_span = self.prev_token.span;
                 let mut err = self.span_fatal_err(self.token.span, Error::UselessDocComment);
                 self.bump(); // consume the doc comment
@@ -1251,6 +1262,25 @@ impl<'a> Parser<'a> {
                     sp,
                     &format!("expected `,`, or `}}`, found {}", super::token_descr(&self.token)),
                 );
+
+                // Try to recover extra trailing angle brackets
+                let mut recovered = false;
+                if let TyKind::Path(_, Path { segments, .. }) = &a_var.ty.kind {
+                    if let Some(last_segment) = segments.last() {
+                        recovered = self.check_trailing_angle_brackets(
+                            last_segment,
+                            &[&token::Comma, &token::CloseDelim(token::Brace)],
+                        );
+                        if recovered {
+                            // Handle a case like `Vec<u8>>,` where we can continue parsing fields
+                            // after the comma
+                            self.eat(&token::Comma);
+                            // `check_trailing_angle_brackets` already emitted a nicer error
+                            err.cancel();
+                        }
+                    }
+                }
+
                 if self.token.is_ident() {
                     // This is likely another field; emit the diagnostic and keep going
                     err.span_suggestion(
@@ -1260,6 +1290,14 @@ impl<'a> Parser<'a> {
                         Applicability::MachineApplicable,
                     );
                     err.emit();
+                    recovered = true;
+                }
+
+                if recovered {
+                    // Make sure an error was emitted (either by recovering an angle bracket,
+                    // or by finding an identifier as the next token), since we're
+                    // going to continue parsing
+                    assert!(self.sess.span_diagnostic.has_errors());
                 } else {
                     return Err(err);
                 }
@@ -1275,7 +1313,7 @@ impl<'a> Parser<'a> {
         vis: Visibility,
         attrs: Vec<Attribute>,
     ) -> PResult<'a, StructField> {
-        let name = self.parse_ident()?;
+        let name = self.parse_ident_common(false)?;
         self.expect(&token::Colon)?;
         let ty = self.parse_ty()?;
         Ok(StructField {
@@ -1454,21 +1492,31 @@ impl<'a> Parser<'a> {
         &mut self,
         attrs: &mut Vec<Attribute>,
         req_name: ReqName,
+        sig_lo: Span,
     ) -> PResult<'a, (Ident, FnSig, Generics, Option<P<Block>>)> {
         let header = self.parse_fn_front_matter()?; // `const ... fn`
         let ident = self.parse_ident()?; // `foo`
         let mut generics = self.parse_generics()?; // `<'a, T, ...>`
         let decl = self.parse_fn_decl(req_name, AllowPlus::Yes)?; // `(p: u8, ...)`
         generics.where_clause = self.parse_where_clause()?; // `where T: Ord`
-        let body = self.parse_fn_body(attrs)?; // `;` or `{ ... }`.
-        Ok((ident, FnSig { header, decl }, generics, body))
+
+        let mut sig_hi = self.prev_token.span;
+        let body = self.parse_fn_body(attrs, &mut sig_hi)?; // `;` or `{ ... }`.
+        let fn_sig_span = sig_lo.to(sig_hi);
+        Ok((ident, FnSig { header, decl, span: fn_sig_span }, generics, body))
     }
 
     /// Parse the "body" of a function.
     /// This can either be `;` when there's no body,
     /// or e.g. a block when the function is a provided one.
-    fn parse_fn_body(&mut self, attrs: &mut Vec<Attribute>) -> PResult<'a, Option<P<Block>>> {
+    fn parse_fn_body(
+        &mut self,
+        attrs: &mut Vec<Attribute>,
+        sig_hi: &mut Span,
+    ) -> PResult<'a, Option<P<Block>>> {
         let (inner_attrs, body) = if self.check(&token::Semi) {
+            // Include the trailing semicolon in the span of the signature
+            *sig_hi = self.token.span;
             self.bump(); // `;`
             (Vec::new(), None)
         } else if self.check(&token::OpenDelim(token::Brace)) || self.token.is_whole_block() {
@@ -1550,7 +1598,7 @@ impl<'a> Parser<'a> {
         if span.rust_2015() {
             let diag = self.diagnostic();
             struct_span_err!(diag, span, E0670, "`async fn` is not permitted in the 2015 edition")
-                .note("to use `async fn`, switch to Rust 2018")
+                .span_label(span, "to use `async fn`, switch to Rust 2018")
                 .help("set `edition = \"2018\"` in `Cargo.toml`")
                 .note("for more on editions, read https://doc.rust-lang.org/edition-guide")
                 .emit();
@@ -1650,7 +1698,7 @@ impl<'a> Parser<'a> {
                 // Recover from attempting to parse the argument as a type without pattern.
                 Err(mut err) => {
                     err.cancel();
-                    mem::replace(self, parser_snapshot_before_ty);
+                    *self = parser_snapshot_before_ty;
                     self.recover_arg_parse()?
                 }
             }

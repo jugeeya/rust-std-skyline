@@ -5,7 +5,7 @@ use rustc_span::symbol::kw;
 /// Associative operator with precedence.
 ///
 /// This is the enum which specifies operator precedence and fixity to the parser.
-#[derive(PartialEq, Debug)]
+#[derive(Copy, Clone, PartialEq, Debug)]
 pub enum AssocOp {
     /// `+`
     Add,
@@ -222,7 +222,6 @@ impl AssocOp {
             Greater | // `{ 42 } > 3`
             GreaterEqual | // `{ 42 } >= 3`
             AssignOp(_) | // `{ 42 } +=`
-            LAnd | // `{ 42 } &&foo`
             As | // `{ 42 } as usize`
             // Equal | // `{ 42 } == { 42 }`    Accepting these here would regress incorrect
             // NotEqual | // `{ 42 } != { 42 }  struct literals parser recovery.
@@ -394,7 +393,7 @@ pub fn contains_exterior_struct_lit(value: &ast::Expr) -> bool {
             contains_exterior_struct_lit(&x)
         }
 
-        ast::ExprKind::MethodCall(.., ref exprs) => {
+        ast::ExprKind::MethodCall(.., ref exprs, _) => {
             // X { y: 1 }.bar(...)
             contains_exterior_struct_lit(&exprs[0])
         }

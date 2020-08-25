@@ -8,7 +8,7 @@ use rustc_middle::ty::subst::{GenericArg, GenericArgKind};
 use rustc_middle::ty::{self, Instance, Ty, TyCtxt, TypeFoldable};
 use rustc_middle::util::common::record_time;
 
-use log::debug;
+use tracing::debug;
 
 use std::fmt::{self, Write};
 use std::mem::{self, discriminant};
@@ -116,7 +116,6 @@ fn get_symbol_hash<'tcx>(
 
         // also include any type parameters (for generic items)
         assert!(!substs.has_erasable_regions());
-        assert!(!substs.needs_subst());
         substs.hash_stable(&mut hcx, &mut hasher);
 
         if let Some(instantiating_crate) = instantiating_crate {
@@ -137,7 +136,7 @@ fn get_symbol_hash<'tcx>(
 }
 
 // Follow C++ namespace-mangling style, see
-// http://en.wikipedia.org/wiki/Name_mangling for more info.
+// https://en.wikipedia.org/wiki/Name_mangling for more info.
 //
 // It turns out that on macOS you can actually have arbitrary symbols in
 // function names (at least when given to LLVM), but this is not possible
@@ -216,7 +215,6 @@ impl Printer<'tcx> for SymbolPrinter<'tcx> {
             ty::FnDef(def_id, substs)
             | ty::Opaque(def_id, substs)
             | ty::Projection(ty::ProjectionTy { item_def_id: def_id, substs })
-            | ty::UnnormalizedProjection(ty::ProjectionTy { item_def_id: def_id, substs })
             | ty::Closure(def_id, substs)
             | ty::Generator(def_id, substs, _) => self.print_def_path(def_id, substs),
             _ => self.pretty_print_type(ty),
@@ -264,7 +262,6 @@ impl Printer<'tcx> for SymbolPrinter<'tcx> {
             ty::FnDef(..)
             | ty::Opaque(..)
             | ty::Projection(_)
-            | ty::UnnormalizedProjection(_)
             | ty::Closure(..)
             | ty::Generator(..)
                 if trait_ref.is_none() =>

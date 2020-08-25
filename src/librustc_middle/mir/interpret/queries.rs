@@ -18,7 +18,7 @@ impl<'tcx> TyCtxt<'tcx> {
         let substs = InternalSubsts::identity_for_item(self, def_id);
         let instance = ty::Instance::new(def_id, substs);
         let cid = GlobalId { instance, promoted: None };
-        let param_env = self.param_env(def_id).with_reveal_all();
+        let param_env = self.param_env(def_id).with_reveal_all_normalized(self);
         self.const_eval_global_id(param_env, cid, None)
     }
 
@@ -34,17 +34,18 @@ impl<'tcx> TyCtxt<'tcx> {
     pub fn const_eval_resolve(
         self,
         param_env: ty::ParamEnv<'tcx>,
-        def_id: DefId,
+        def: ty::WithOptConstParam<DefId>,
         substs: SubstsRef<'tcx>,
         promoted: Option<mir::Promoted>,
         span: Option<Span>,
     ) -> ConstEvalResult<'tcx> {
-        let instance = ty::Instance::resolve(self, param_env, def_id, substs);
-        if let Some(instance) = instance {
-            let cid = GlobalId { instance, promoted };
-            self.const_eval_global_id(param_env, cid, span)
-        } else {
-            Err(ErrorHandled::TooGeneric)
+        match ty::Instance::resolve_opt_const_arg(self, param_env, def, substs) {
+            Ok(Some(instance)) => {
+                let cid = GlobalId { instance, promoted };
+                self.const_eval_global_id(param_env, cid, span)
+            }
+            Ok(None) => Err(ErrorHandled::TooGeneric),
+            Err(error_reported) => Err(ErrorHandled::Reported(error_reported)),
         }
     }
 
@@ -72,5 +73,28 @@ impl<'tcx> TyCtxt<'tcx> {
         } else {
             self.const_eval_validated(inputs)
         }
+    }
+
+    /// Evaluate a static's initializer, returning the allocation of the initializer's memory.
+    pub fn eval_static_initializer(
+        self,
+        def_id: DefId,
+    ) -> Result<&'tcx mir::Allocation, ErrorHandled> {
+        trace!("eval_static_initializer: Need to compute {:?}", def_id);
+        assert!(self.is_static(def_id));
+        let instance = ty::Instance::mono(self, def_id);
+        let gid = GlobalId { instance, promoted: None };
+        self.eval_to_allocation(gid, ty::ParamEnv::reveal_all())
+    }
+
+    /// Evaluate anything constant-like, returning the allocation of the final memory.
+    fn eval_to_allocation(
+        self,
+        gid: GlobalId<'tcx>,
+        param_env: ty::ParamEnv<'tcx>,
+    ) -> Result<&'tcx mir::Allocation, ErrorHandled> {
+        trace!("eval_to_allocation: Need to compute {:?}", gid);
+        let raw_const = self.const_eval_raw(param_env.and(gid))?;
+        Ok(self.global_alloc(raw_const.alloc_id).unwrap_memory())
     }
 }

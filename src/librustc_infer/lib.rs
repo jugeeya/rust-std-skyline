@@ -13,11 +13,15 @@
 //! This API is completely unstable and subject to change.
 
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/")]
+#![feature(bindings_after_at)]
 #![feature(bool_to_option)]
 #![feature(box_patterns)]
 #![feature(box_syntax)]
+#![feature(const_fn)]
+#![feature(const_panic)]
+#![feature(extend_one)]
 #![feature(never_type)]
-#![feature(range_is_empty)]
+#![feature(or_patterns)]
 #![feature(in_band_lifetimes)]
 #![feature(crate_visibility_modifier)]
 #![recursion_limit = "512"] // For rustdoc
@@ -28,7 +32,7 @@ extern crate rustc_macros;
 #[macro_use]
 extern crate rustc_data_structures;
 #[macro_use]
-extern crate log;
+extern crate tracing;
 #[macro_use]
 extern crate rustc_middle;
 

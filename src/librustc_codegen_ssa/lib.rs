@@ -1,11 +1,15 @@
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/")]
 #![feature(bool_to_option)]
+#![feature(option_expect_none)]
 #![feature(box_patterns)]
 #![feature(try_blocks)]
 #![feature(in_band_lifetimes)]
 #![feature(nll)]
+#![feature(or_patterns)]
 #![feature(trusted_len)]
 #![feature(associated_type_bounds)]
+#![feature(const_fn)] // for rustc_index::newtype_index
+#![feature(const_panic)] // for rustc_index::newtype_index
 #![recursion_limit = "256"]
 
 //! This crate contains codegen code that is used by all codegen backends (LLVM and others).
@@ -13,7 +17,9 @@
 //! have to be implemented by each backends.
 
 #[macro_use]
-extern crate log;
+extern crate rustc_macros;
+#[macro_use]
+extern crate tracing;
 #[macro_use]
 extern crate rustc_middle;
 
@@ -23,7 +29,7 @@ use rustc_data_structures::sync::Lrc;
 use rustc_hir::def_id::CrateNum;
 use rustc_hir::LangItem;
 use rustc_middle::dep_graph::WorkProduct;
-use rustc_middle::middle::cstore::{CrateSource, LibSource, NativeLibrary};
+use rustc_middle::middle::cstore::{CrateSource, LibSource, NativeLib};
 use rustc_middle::middle::dependency_format::Dependencies;
 use rustc_middle::ty::query::Providers;
 use rustc_session::config::{OutputFilenames, OutputType, RUST_CGU_EXT};
@@ -33,6 +39,7 @@ use std::path::{Path, PathBuf};
 pub mod back;
 pub mod base;
 pub mod common;
+pub mod coverageinfo;
 pub mod debuginfo;
 pub mod glue;
 pub mod meth;
@@ -54,41 +61,27 @@ pub struct ModuleCodegen<M> {
 
 // FIXME(eddyb) maybe include the crate name in this?
 pub const METADATA_FILENAME: &str = "lib.rmeta";
-pub const RLIB_BYTECODE_EXTENSION: &str = "bc.z";
 
 impl<M> ModuleCodegen<M> {
     pub fn into_compiled_module(
         self,
         emit_obj: bool,
         emit_bc: bool,
-        emit_bc_compressed: bool,
         outputs: &OutputFilenames,
     ) -> CompiledModule {
         let object = emit_obj.then(|| outputs.temp_path(OutputType::Object, Some(&self.name)));
         let bytecode = emit_bc.then(|| outputs.temp_path(OutputType::Bitcode, Some(&self.name)));
-        let bytecode_compressed = emit_bc_compressed.then(|| {
-            outputs
-                .temp_path(OutputType::Bitcode, Some(&self.name))
-                .with_extension(RLIB_BYTECODE_EXTENSION)
-        });
 
-        CompiledModule {
-            name: self.name.clone(),
-            kind: self.kind,
-            object,
-            bytecode,
-            bytecode_compressed,
-        }
+        CompiledModule { name: self.name.clone(), kind: self.kind, object, bytecode }
     }
 }
 
-#[derive(Debug, RustcEncodable, RustcDecodable)]
+#[derive(Debug, Encodable, Decodable)]
 pub struct CompiledModule {
     pub name: String,
     pub kind: ModuleKind,
     pub object: Option<PathBuf>,
     pub bytecode: Option<PathBuf>,
-    pub bytecode_compressed: Option<PathBuf>,
 }
 
 pub struct CachedModuleCodegen {
@@ -96,7 +89,7 @@ pub struct CachedModuleCodegen {
     pub source: WorkProduct,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, RustcEncodable, RustcDecodable)]
+#[derive(Copy, Clone, Debug, PartialEq, Encodable, Decodable)]
 pub enum ModuleKind {
     Regular,
     Metadata,
@@ -119,15 +112,15 @@ bitflags::bitflags! {
 /// identifiers (`CrateNum`) to `CrateSource`. The other fields map `CrateNum` to the crate's own
 /// additional properties, so that effectively we can retrieve each dependent crate's `CrateSource`
 /// and the corresponding properties without referencing information outside of a `CrateInfo`.
-#[derive(Debug, RustcEncodable, RustcDecodable)]
+#[derive(Debug, Encodable, Decodable)]
 pub struct CrateInfo {
     pub panic_runtime: Option<CrateNum>,
     pub compiler_builtins: Option<CrateNum>,
     pub profiler_runtime: Option<CrateNum>,
     pub is_no_builtins: FxHashSet<CrateNum>,
-    pub native_libraries: FxHashMap<CrateNum, Lrc<Vec<NativeLibrary>>>,
+    pub native_libraries: FxHashMap<CrateNum, Lrc<Vec<NativeLib>>>,
     pub crate_name: FxHashMap<CrateNum, String>,
-    pub used_libraries: Lrc<Vec<NativeLibrary>>,
+    pub used_libraries: Lrc<Vec<NativeLib>>,
     pub link_args: Lrc<Vec<String>>,
     pub used_crate_source: FxHashMap<CrateNum, Lrc<CrateSource>>,
     pub used_crates_static: Vec<(CrateNum, LibSource)>,
@@ -137,7 +130,7 @@ pub struct CrateInfo {
     pub dependency_formats: Lrc<Dependencies>,
 }
 
-#[derive(RustcEncodable, RustcDecodable)]
+#[derive(Encodable, Decodable)]
 pub struct CodegenResults {
     pub crate_name: Symbol,
     pub modules: Vec<CompiledModule>,
@@ -150,12 +143,12 @@ pub struct CodegenResults {
     pub crate_info: CrateInfo,
 }
 
-pub fn provide(providers: &mut Providers<'_>) {
+pub fn provide(providers: &mut Providers) {
     crate::back::symbol_export::provide(providers);
     crate::base::provide_both(providers);
 }
 
-pub fn provide_extern(providers: &mut Providers<'_>) {
+pub fn provide_extern(providers: &mut Providers) {
     crate::back::symbol_export::provide_extern(providers);
     crate::base::provide_both(providers);
 }

@@ -1,13 +1,13 @@
 use crate::util::check_builtin_macro_attribute;
 
-use rustc_ast::ast::{self, Attribute, Expr, FnHeader, FnSig, Generics, Ident, Param};
-use rustc_ast::ast::{ItemKind, Mutability, Stmt, Ty, TyKind, Unsafe};
 use rustc_ast::expand::allocator::{
     AllocatorKind, AllocatorMethod, AllocatorTy, ALLOCATOR_METHODS,
 };
 use rustc_ast::ptr::P;
+use rustc_ast::{self as ast, Attribute, Expr, FnHeader, FnSig, Generics, Param};
+use rustc_ast::{ItemKind, Mutability, Stmt, Ty, TyKind, Unsafe};
 use rustc_expand::base::{Annotatable, ExtCtxt};
-use rustc_span::symbol::{kw, sym, Symbol};
+use rustc_span::symbol::{kw, sym, Ident, Symbol};
 use rustc_span::Span;
 
 pub fn expand(
@@ -19,7 +19,7 @@ pub fn expand(
     check_builtin_macro_attribute(ecx, meta_item, sym::global_allocator);
 
     let not_static = |item: Annotatable| {
-        ecx.parse_sess.span_diagnostic.span_err(item.span(), "allocators must be statics");
+        ecx.sess.parse_sess.span_diagnostic.span_err(item.span(), "allocators must be statics");
         vec![item]
     };
     let item = match item {
@@ -58,7 +58,7 @@ impl AllocFnFactory<'_, '_> {
         let mut abi_args = Vec::new();
         let mut i = 0;
         let mut mk = || {
-            let name = self.cx.ident_of(&format!("arg{}", i), self.span);
+            let name = Ident::from_str_and_span(&format!("arg{}", i), self.span);
             i += 1;
             name
         };
@@ -67,24 +67,20 @@ impl AllocFnFactory<'_, '_> {
         let (output_ty, output_expr) = self.ret_ty(&method.output, result);
         let decl = self.cx.fn_decl(abi_args, ast::FnRetTy::Ty(output_ty));
         let header = FnHeader { unsafety: Unsafe::Yes(self.span), ..FnHeader::default() };
-        let sig = FnSig { decl, header };
+        let sig = FnSig { decl, header, span: self.span };
         let block = Some(self.cx.block_expr(output_expr));
         let kind = ItemKind::Fn(ast::Defaultness::Final, sig, Generics::default(), block);
         let item = self.cx.item(
             self.span,
-            self.cx.ident_of(&self.kind.fn_name(method.name), self.span),
+            Ident::from_str_and_span(&self.kind.fn_name(method.name), self.span),
             self.attrs(),
             kind,
         );
         self.cx.stmt_item(self.span, item)
     }
 
-    fn call_allocator(&self, method: &str, mut args: Vec<P<Expr>>) -> P<Expr> {
-        let method = self.cx.std_path(&[
-            Symbol::intern("alloc"),
-            Symbol::intern("GlobalAlloc"),
-            Symbol::intern(method),
-        ]);
+    fn call_allocator(&self, method: Symbol, mut args: Vec<P<Expr>>) -> P<Expr> {
+        let method = self.cx.std_path(&[sym::alloc, sym::GlobalAlloc, method]);
         let method = self.cx.expr_path(self.cx.path(self.span, method));
         let allocator = self.cx.path_ident(self.span, self.global);
         let allocator = self.cx.expr_path(allocator);
@@ -115,11 +111,8 @@ impl AllocFnFactory<'_, '_> {
                 args.push(self.cx.param(self.span, size, ty_usize.clone()));
                 args.push(self.cx.param(self.span, align, ty_usize));
 
-                let layout_new = self.cx.std_path(&[
-                    Symbol::intern("alloc"),
-                    Symbol::intern("Layout"),
-                    Symbol::intern("from_size_align_unchecked"),
-                ]);
+                let layout_new =
+                    self.cx.std_path(&[sym::alloc, sym::Layout, sym::from_size_align_unchecked]);
                 let layout_new = self.cx.expr_path(self.cx.path(self.span, layout_new));
                 let size = self.cx.expr_ident(self.span, size);
                 let align = self.cx.expr_ident(self.span, align);

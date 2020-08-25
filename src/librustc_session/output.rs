@@ -1,14 +1,14 @@
 //! Related to out filenames of compilation (e.g. save analysis, binaries).
-use crate::config::{self, Input, OutputFilenames, OutputType};
+use crate::config::{CrateType, Input, OutputFilenames, OutputType};
 use crate::Session;
-use rustc_ast::{ast, attr};
+use rustc_ast as ast;
 use rustc_span::symbol::sym;
 use rustc_span::Span;
 use std::path::{Path, PathBuf};
 
 pub fn out_filename(
     sess: &Session,
-    crate_type: config::CrateType,
+    crate_type: CrateType,
     outputs: &OutputFilenames,
     crate_name: &str,
 ) -> PathBuf {
@@ -45,7 +45,7 @@ fn is_writeable(p: &Path) -> bool {
     }
 }
 
-pub fn find_crate_name(sess: Option<&Session>, attrs: &[ast::Attribute], input: &Input) -> String {
+pub fn find_crate_name(sess: &Session, attrs: &[ast::Attribute], input: &Input) -> String {
     let validate = |s: String, span: Option<Span>| {
         validate_crate_name(sess, &s, span);
         s
@@ -56,22 +56,20 @@ pub fn find_crate_name(sess: Option<&Session>, attrs: &[ast::Attribute], input: 
     // the command line over one found in the #[crate_name] attribute. If we
     // find both we ensure that they're the same later on as well.
     let attr_crate_name =
-        attr::find_by_name(attrs, sym::crate_name).and_then(|at| at.value_str().map(|s| (at, s)));
+        sess.find_by_name(attrs, sym::crate_name).and_then(|at| at.value_str().map(|s| (at, s)));
 
-    if let Some(sess) = sess {
-        if let Some(ref s) = sess.opts.crate_name {
-            if let Some((attr, name)) = attr_crate_name {
-                if name.as_str() != *s {
-                    let msg = format!(
-                        "`--crate-name` and `#[crate_name]` are \
-                                       required to match, but `{}` != `{}`",
-                        s, name
-                    );
-                    sess.span_err(attr.span, &msg);
-                }
+    if let Some(ref s) = sess.opts.crate_name {
+        if let Some((attr, name)) = attr_crate_name {
+            if name.as_str() != *s {
+                let msg = format!(
+                    "`--crate-name` and `#[crate_name]` are \
+                                   required to match, but `{}` != `{}`",
+                    s, name
+                );
+                sess.span_err(attr.span, &msg);
             }
-            return validate(s.clone(), None);
         }
+        return validate(s.clone(), None);
     }
 
     if let Some((attr, s)) = attr_crate_name {
@@ -85,9 +83,7 @@ pub fn find_crate_name(sess: Option<&Session>, attrs: &[ast::Attribute], input: 
                                    `{}` has a leading hyphen",
                     s
                 );
-                if let Some(sess) = sess {
-                    sess.err(&msg);
-                }
+                sess.err(&msg);
             } else {
                 return validate(s.replace("-", "_"), None);
             }
@@ -97,14 +93,13 @@ pub fn find_crate_name(sess: Option<&Session>, attrs: &[ast::Attribute], input: 
     "rust_out".to_string()
 }
 
-pub fn validate_crate_name(sess: Option<&Session>, s: &str, sp: Option<Span>) {
+pub fn validate_crate_name(sess: &Session, s: &str, sp: Option<Span>) {
     let mut err_count = 0;
     {
         let mut say = |s: &str| {
-            match (sp, sess) {
-                (_, None) => panic!("{}", s),
-                (Some(sp), Some(sess)) => sess.span_err(sp, s),
-                (None, Some(sess)) => sess.err(s),
+            match sp {
+                Some(sp) => sess.span_err(sp, s),
+                None => sess.err(s),
             }
             err_count += 1;
         };
@@ -123,7 +118,7 @@ pub fn validate_crate_name(sess: Option<&Session>, s: &str, sp: Option<Span>) {
     }
 
     if err_count > 0 {
-        sess.unwrap().abort_if_errors();
+        sess.abort_if_errors();
     }
 }
 
@@ -146,27 +141,27 @@ pub fn filename_for_metadata(
 
 pub fn filename_for_input(
     sess: &Session,
-    crate_type: config::CrateType,
+    crate_type: CrateType,
     crate_name: &str,
     outputs: &OutputFilenames,
 ) -> PathBuf {
     let libname = format!("{}{}", crate_name, sess.opts.cg.extra_filename);
 
     match crate_type {
-        config::CrateType::Rlib => outputs.out_directory.join(&format!("lib{}.rlib", libname)),
-        config::CrateType::Cdylib | config::CrateType::ProcMacro | config::CrateType::Dylib => {
+        CrateType::Rlib => outputs.out_directory.join(&format!("lib{}.rlib", libname)),
+        CrateType::Cdylib | CrateType::ProcMacro | CrateType::Dylib => {
             let (prefix, suffix) =
                 (&sess.target.target.options.dll_prefix, &sess.target.target.options.dll_suffix);
             outputs.out_directory.join(&format!("{}{}{}", prefix, libname, suffix))
         }
-        config::CrateType::Staticlib => {
+        CrateType::Staticlib => {
             let (prefix, suffix) = (
                 &sess.target.target.options.staticlib_prefix,
                 &sess.target.target.options.staticlib_suffix,
             );
             outputs.out_directory.join(&format!("{}{}{}", prefix, libname, suffix))
         }
-        config::CrateType::Executable => {
+        CrateType::Executable => {
             let suffix = &sess.target.target.options.exe_suffix;
             let out_filename = outputs.path(OutputType::Exe);
             if suffix.is_empty() { out_filename } else { out_filename.with_extension(&suffix[1..]) }
@@ -183,18 +178,18 @@ pub fn filename_for_input(
 /// way to run iOS binaries anyway without jailbreaking and
 /// interaction with Rust code through static library is the only
 /// option for now
-pub fn default_output_for_target(sess: &Session) -> config::CrateType {
+pub fn default_output_for_target(sess: &Session) -> CrateType {
     if !sess.target.target.options.executables {
-        config::CrateType::Staticlib
+        CrateType::Staticlib
     } else {
-        config::CrateType::Executable
+        CrateType::Executable
     }
 }
 
 /// Checks if target supports crate_type as output
-pub fn invalid_output_for_target(sess: &Session, crate_type: config::CrateType) -> bool {
+pub fn invalid_output_for_target(sess: &Session, crate_type: CrateType) -> bool {
     match crate_type {
-        config::CrateType::Cdylib | config::CrateType::Dylib | config::CrateType::ProcMacro => {
+        CrateType::Cdylib | CrateType::Dylib | CrateType::ProcMacro => {
             if !sess.target.target.options.dynamic_linking {
                 return true;
             }
@@ -208,12 +203,12 @@ pub fn invalid_output_for_target(sess: &Session, crate_type: config::CrateType) 
     }
     if sess.target.target.options.only_cdylib {
         match crate_type {
-            config::CrateType::ProcMacro | config::CrateType::Dylib => return true,
+            CrateType::ProcMacro | CrateType::Dylib => return true,
             _ => {}
         }
     }
     if !sess.target.target.options.executables {
-        if crate_type == config::CrateType::Executable {
+        if crate_type == CrateType::Executable {
             return true;
         }
     }

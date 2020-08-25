@@ -1,22 +1,22 @@
 use super::ty::AllowPlus;
 use super::{BlockMode, Parser, PathStyle, SemiColonMode, SeqSep, TokenExpectType, TokenType};
 
-use rustc_ast::ast::{
-    self, BinOpKind, BindingMode, BlockCheckMode, Expr, ExprKind, Ident, Item, Param,
-};
-use rustc_ast::ast::{AttrVec, ItemKind, Mutability, Pat, PatKind, PathSegment, QSelf, Ty, TyKind};
 use rustc_ast::ptr::P;
 use rustc_ast::token::{self, Lit, LitKind, TokenKind};
 use rustc_ast::util::parser::AssocOp;
+use rustc_ast::{
+    self as ast, AngleBracketedArgs, AttrVec, BinOpKind, BindingMode, BlockCheckMode, Expr,
+    ExprKind, Item, ItemKind, Mutability, Param, Pat, PatKind, PathSegment, QSelf, Ty, TyKind,
+};
 use rustc_ast_pretty::pprust;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::{pluralize, struct_span_err};
 use rustc_errors::{Applicability, DiagnosticBuilder, Handler, PResult};
 use rustc_span::source_map::Spanned;
-use rustc_span::symbol::kw;
+use rustc_span::symbol::{kw, Ident};
 use rustc_span::{MultiSpan, Span, SpanSnippetError, DUMMY_SP};
 
-use log::{debug, trace};
+use tracing::{debug, trace};
 
 const TURBOFISH: &str = "use `::<...>` instead of `<...>` to specify type arguments";
 
@@ -26,6 +26,7 @@ pub(super) fn dummy_arg(ident: Ident) -> Param {
         id: ast::DUMMY_NODE_ID,
         kind: PatKind::Ident(BindingMode::ByValue(Mutability::Not), ident, None),
         span: ident.span,
+        tokens: None,
     });
     let ty = Ty { kind: TyKind::Err, span: ident.span, id: ast::DUMMY_NODE_ID };
     Param {
@@ -83,7 +84,12 @@ impl RecoverQPath for Pat {
         self.to_ty()
     }
     fn recovered(qself: Option<QSelf>, path: ast::Path) -> Self {
-        Self { span: path.span, kind: PatKind::Path(qself, path), id: ast::DUMMY_NODE_ID }
+        Self {
+            span: path.span,
+            kind: PatKind::Path(qself, path),
+            id: ast::DUMMY_NODE_ID,
+            tokens: None,
+        }
     }
 }
 
@@ -97,6 +103,7 @@ impl RecoverQPath for Expr {
             kind: ExprKind::Path(qself, path),
             attrs: AttrVec::new(),
             id: ast::DUMMY_NODE_ID,
+            tokens: None,
         }
     }
 }
@@ -332,6 +339,7 @@ impl<'a> Parser<'a> {
                         Applicability::MachineApplicable
                     },
                 );
+                self.sess.type_ascription_path_suggestions.borrow_mut().insert(sp);
             } else if op_pos.line != next_pos.line && maybe_expected_semicolon {
                 err.span_suggestion(
                     sp,
@@ -347,13 +355,16 @@ impl<'a> Parser<'a> {
             if allow_unstable {
                 // Give extra information about type ascription only if it's a nightly compiler.
                 err.note(
-                    "`#![feature(type_ascription)]` lets you annotate an expression with a \
-                          type: `<expr>: <type>`",
+                    "`#![feature(type_ascription)]` lets you annotate an expression with a type: \
+                     `<expr>: <type>`",
                 );
-                err.note(
-                    "see issue #23416 <https://github.com/rust-lang/rust/issues/23416> \
-                     for more information",
-                );
+                if !likely_path {
+                    // Avoid giving too much info when it was likely an unrelated typo.
+                    err.note(
+                        "see issue #23416 <https://github.com/rust-lang/rust/issues/23416> \
+                        for more information",
+                    );
+                }
             }
         }
     }
@@ -377,7 +388,14 @@ impl<'a> Parser<'a> {
     /// let _ = vec![1, 2, 3].into_iter().collect::<Vec<usize>>>>();
     ///                                                        ^^ help: remove extra angle brackets
     /// ```
-    pub(super) fn check_trailing_angle_brackets(&mut self, segment: &PathSegment, end: TokenKind) {
+    ///
+    /// If `true` is returned, then trailing brackets were recovered, tokens were consumed
+    /// up until one of the tokens in 'end' was encountered, and an error was emitted.
+    pub(super) fn check_trailing_angle_brackets(
+        &mut self,
+        segment: &PathSegment,
+        end: &[&TokenKind],
+    ) -> bool {
         // This function is intended to be invoked after parsing a path segment where there are two
         // cases:
         //
@@ -410,7 +428,7 @@ impl<'a> Parser<'a> {
             parsed_angle_bracket_args,
         );
         if !parsed_angle_bracket_args {
-            return;
+            return false;
         }
 
         // Keep the span at the start so we can highlight the sequence of `>` characters to be
@@ -448,18 +466,18 @@ impl<'a> Parser<'a> {
             number_of_gt, number_of_shr,
         );
         if number_of_gt < 1 && number_of_shr < 1 {
-            return;
+            return false;
         }
 
         // Finally, double check that we have our end token as otherwise this is the
         // second case.
         if self.look_ahead(position, |t| {
             trace!("check_trailing_angle_brackets: t={:?}", t);
-            *t == end
+            end.contains(&&t.kind)
         }) {
             // Eat from where we started until the end token so that parsing can continue
             // as if we didn't have those extra angle brackets.
-            self.eat_to_tokens(&[&end]);
+            self.eat_to_tokens(end);
             let span = lo.until(self.token.span);
 
             let total_num_of_gt = number_of_gt + number_of_shr * 2;
@@ -474,6 +492,59 @@ impl<'a> Parser<'a> {
                 Applicability::MachineApplicable,
             )
             .emit();
+            return true;
+        }
+        false
+    }
+
+    /// Check if a method call with an intended turbofish has been written without surrounding
+    /// angle brackets.
+    pub(super) fn check_turbofish_missing_angle_brackets(&mut self, segment: &mut PathSegment) {
+        if token::ModSep == self.token.kind && segment.args.is_none() {
+            let snapshot = self.clone();
+            self.bump();
+            let lo = self.token.span;
+            match self.parse_angle_args() {
+                Ok(args) => {
+                    let span = lo.to(self.prev_token.span);
+                    // Detect trailing `>` like in `x.collect::Vec<_>>()`.
+                    let mut trailing_span = self.prev_token.span.shrink_to_hi();
+                    while self.token.kind == token::BinOp(token::Shr)
+                        || self.token.kind == token::Gt
+                    {
+                        trailing_span = trailing_span.to(self.token.span);
+                        self.bump();
+                    }
+                    if self.token.kind == token::OpenDelim(token::Paren) {
+                        // Recover from bad turbofish: `foo.collect::Vec<_>()`.
+                        let args = AngleBracketedArgs { args, span }.into();
+                        segment.args = args;
+
+                        self.struct_span_err(
+                            span,
+                            "generic parameters without surrounding angle brackets",
+                        )
+                        .multipart_suggestion(
+                            "surround the type parameters with angle brackets",
+                            vec![
+                                (span.shrink_to_lo(), "<".to_string()),
+                                (trailing_span, ">".to_string()),
+                            ],
+                            Applicability::MachineApplicable,
+                        )
+                        .emit();
+                    } else {
+                        // This doesn't look like an invalid turbofish, can't recover parse state.
+                        *self = snapshot;
+                    }
+                }
+                Err(mut err) => {
+                    // We could't parse generic parameters, unlikely to be a turbofish. Rely on
+                    // generic parse error instead.
+                    err.cancel();
+                    *self = snapshot;
+                }
+            }
         }
     }
 
@@ -508,11 +579,11 @@ impl<'a> Parser<'a> {
                 // `x == y == z`
                 (BinOpKind::Eq, AssocOp::Equal) |
                 // `x < y < z` and friends.
-                (BinOpKind::Lt, AssocOp::Less) | (BinOpKind::Lt, AssocOp::LessEqual) |
-                (BinOpKind::Le, AssocOp::LessEqual) | (BinOpKind::Le, AssocOp::Less) |
+                (BinOpKind::Lt, AssocOp::Less | AssocOp::LessEqual) |
+                (BinOpKind::Le, AssocOp::LessEqual | AssocOp::Less) |
                 // `x > y > z` and friends.
-                (BinOpKind::Gt, AssocOp::Greater) | (BinOpKind::Gt, AssocOp::GreaterEqual) |
-                (BinOpKind::Ge, AssocOp::GreaterEqual) | (BinOpKind::Ge, AssocOp::Greater) => {
+                (BinOpKind::Gt, AssocOp::Greater | AssocOp::GreaterEqual) |
+                (BinOpKind::Ge, AssocOp::GreaterEqual | AssocOp::Greater) => {
                     let expr_to_str = |e: &Expr| {
                         self.span_to_snippet(e.span)
                             .unwrap_or_else(|_| pprust::expr_to_string(&e))
@@ -526,8 +597,7 @@ impl<'a> Parser<'a> {
                     false // Keep the current parse behavior, where the AST is `(x < y) < z`.
                 }
                 // `x == y < z`
-                (BinOpKind::Eq, AssocOp::Less) | (BinOpKind::Eq, AssocOp::LessEqual) |
-                (BinOpKind::Eq, AssocOp::Greater) | (BinOpKind::Eq, AssocOp::GreaterEqual) => {
+                (BinOpKind::Eq, AssocOp::Less | AssocOp::LessEqual | AssocOp::Greater | AssocOp::GreaterEqual) => {
                     // Consume `z`/outer-op-rhs.
                     let snapshot = self.clone();
                     match self.parse_expr() {
@@ -545,8 +615,7 @@ impl<'a> Parser<'a> {
                     }
                 }
                 // `x > y == z`
-                (BinOpKind::Lt, AssocOp::Equal) | (BinOpKind::Le, AssocOp::Equal) |
-                (BinOpKind::Gt, AssocOp::Equal) | (BinOpKind::Ge, AssocOp::Equal) => {
+                (BinOpKind::Lt | BinOpKind::Le | BinOpKind::Gt | BinOpKind::Ge, AssocOp::Equal) => {
                     let snapshot = self.clone();
                     // At this point it is always valid to enclose the lhs in parentheses, no
                     // further checks are necessary.
@@ -579,11 +648,13 @@ impl<'a> Parser<'a> {
     /// Keep in mind that given that `outer_op.is_comparison()` holds and comparison ops are left
     /// associative we can infer that we have:
     ///
+    /// ```text
     ///           outer_op
     ///           /   \
     ///     inner_op   r2
     ///        /  \
     ///      l1    r1
+    /// ```
     pub(super) fn check_no_chained_comparison(
         &mut self,
         inner_op: &Expr,
@@ -929,13 +1000,26 @@ impl<'a> Parser<'a> {
             return Ok(());
         }
         let sm = self.sess.source_map();
-        let msg = format!("expected `;`, found `{}`", super::token_descr(&self.token));
+        let msg = format!("expected `;`, found {}", super::token_descr(&self.token));
         let appl = Applicability::MachineApplicable;
         if self.token.span == DUMMY_SP || self.prev_token.span == DUMMY_SP {
             // Likely inside a macro, can't provide meaningful suggestions.
             return self.expect(&token::Semi).map(drop);
         } else if !sm.is_multiline(self.prev_token.span.until(self.token.span)) {
             // The current token is in the same line as the prior token, not recoverable.
+        } else if [token::Comma, token::Colon].contains(&self.token.kind)
+            && self.prev_token.kind == token::CloseDelim(token::Paren)
+        {
+            // Likely typo: The current token is on a new line and is expected to be
+            // `.`, `;`, `?`, or an operator after a close delimiter token.
+            //
+            // let a = std::process::Command::new("echo")
+            //         .arg("1")
+            //         ,arg("2")
+            //         ^
+            // https://github.com/rust-lang/rust/issues/72253
+            self.expect(&token::Semi)?;
+            return Ok(());
         } else if self.look_ahead(1, |t| {
             t == &token::CloseDelim(token::Brace) || t.can_begin_expr() && t.kind != token::Colon
         }) && [token::Comma, token::Colon].contains(&self.token.kind)
@@ -949,7 +1033,7 @@ impl<'a> Parser<'a> {
             self.bump();
             let sp = self.prev_token.span;
             self.struct_span_err(sp, &msg)
-                .span_suggestion(sp, "change this to `;`", ";".to_string(), appl)
+                .span_suggestion_short(sp, "change this to `;`", ";".to_string(), appl)
                 .emit();
             return Ok(());
         } else if self.look_ahead(0, |t| {
@@ -1054,6 +1138,39 @@ impl<'a> Parser<'a> {
         }
     }
 
+    pub(super) fn try_macro_suggestion(&mut self) -> PResult<'a, P<Expr>> {
+        let is_try = self.token.is_keyword(kw::Try);
+        let is_questionmark = self.look_ahead(1, |t| t == &token::Not); //check for !
+        let is_open = self.look_ahead(2, |t| t == &token::OpenDelim(token::Paren)); //check for (
+
+        if is_try && is_questionmark && is_open {
+            let lo = self.token.span;
+            self.bump(); //remove try
+            self.bump(); //remove !
+            let try_span = lo.to(self.token.span); //we take the try!( span
+            self.bump(); //remove (
+            let is_empty = self.token == token::CloseDelim(token::Paren); //check if the block is empty
+            self.consume_block(token::Paren, ConsumeClosingDelim::No); //eat the block
+            let hi = self.token.span;
+            self.bump(); //remove )
+            let mut err = self.struct_span_err(lo.to(hi), "use of deprecated `try` macro");
+            err.note("in the 2018 edition `try` is a reserved keyword, and the `try!()` macro is deprecated");
+            let prefix = if is_empty { "" } else { "alternatively, " };
+            if !is_empty {
+                err.multipart_suggestion(
+                    "you can use the `?` operator instead",
+                    vec![(try_span, "".to_owned()), (hi, "?".to_owned())],
+                    Applicability::MachineApplicable,
+                );
+            }
+            err.span_suggestion(lo.shrink_to_lo(), &format!("{}you can still access the deprecated `try!()` macro using the \"raw identifier\" syntax", prefix), "r#".to_string(), Applicability::MachineApplicable);
+            err.emit();
+            Ok(self.mk_expr_err(lo.to(hi)))
+        } else {
+            Err(self.expected_expression_found()) // The user isn't trying to invoke the try! macro
+        }
+    }
+
     /// Recovers a situation like `for ( $pat in $expr )`
     /// and suggest writing `for $pat in $expr` instead.
     ///
@@ -1107,8 +1224,10 @@ impl<'a> Parser<'a> {
             } &&
             !self.token.is_reserved_ident() &&           // v `foo:bar(baz)`
             self.look_ahead(1, |t| t == &token::OpenDelim(token::Paren))
-            || self.look_ahead(1, |t| t == &token::Lt) &&     // `foo:bar<baz`
-            self.look_ahead(2, |t| t.is_ident())
+            || self.look_ahead(1, |t| t == &token::OpenDelim(token::Brace)) // `foo:bar {`
+            || self.look_ahead(1, |t| t == &token::Colon) &&     // `foo:bar::<baz`
+            self.look_ahead(2, |t| t == &token::Lt) &&
+            self.look_ahead(3, |t| t.is_ident())
             || self.look_ahead(1, |t| t == &token::Colon) &&  // `foo:bar:baz`
             self.look_ahead(2, |t| t.is_ident())
             || self.look_ahead(1, |t| t == &token::ModSep)
@@ -1174,10 +1293,13 @@ impl<'a> Parser<'a> {
                 if let Some(sp) = unmatched.unclosed_span {
                     err.span_label(sp, "unclosed delimiter");
                 }
+                // Backticks should be removed to apply suggestions.
+                let mut delim = delim.to_string();
+                delim.retain(|c| c != '`');
                 err.span_suggestion_short(
                     self.prev_token.span.shrink_to_hi(),
-                    &format!("{} may belong here", delim.to_string()),
-                    delim.to_string(),
+                    &format!("`{}` may belong here", delim),
+                    delim,
                     Applicability::MaybeIncorrect,
                 );
                 if unmatched.found_delim.is_none() {
@@ -1303,7 +1425,7 @@ impl<'a> Parser<'a> {
     }
 
     pub(super) fn eat_incorrect_doc_comment_for_param_type(&mut self) {
-        if let token::DocComment(_) = self.token.kind {
+        if let token::DocComment(..) = self.token.kind {
             self.struct_span_err(
                 self.token.span,
                 "documentation comments cannot be applied to a function parameter's type",
@@ -1370,7 +1492,7 @@ impl<'a> Parser<'a> {
                 if self.token != token::Lt {
                     err.span_suggestion(
                         pat.span,
-                        "if this was a parameter name, give it a type",
+                        "if this is a parameter name, give it a type",
                         format!("{}: TypeName", ident),
                         Applicability::HasPlaceholders,
                     );
@@ -1410,7 +1532,8 @@ impl<'a> Parser<'a> {
         .emit();
 
         // Pretend the pattern is `_`, to avoid duplicate errors from AST validation.
-        let pat = P(Pat { kind: PatKind::Wild, span: pat.span, id: ast::DUMMY_NODE_ID });
+        let pat =
+            P(Pat { kind: PatKind::Wild, span: pat.span, id: ast::DUMMY_NODE_ID, tokens: None });
         Ok((pat, ty))
     }
 

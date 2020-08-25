@@ -6,12 +6,12 @@ use super::path::PathStyle;
 use super::{BlockMode, Parser, Restrictions, SemiColonMode};
 use crate::maybe_whole;
 
-use rustc_ast::ast;
-use rustc_ast::ast::{AttrStyle, AttrVec, Attribute, MacCall, MacStmtStyle};
-use rustc_ast::ast::{Block, BlockCheckMode, Expr, ExprKind, Local, Stmt, StmtKind, DUMMY_NODE_ID};
+use rustc_ast as ast;
 use rustc_ast::ptr::P;
 use rustc_ast::token::{self, TokenKind};
 use rustc_ast::util::classify;
+use rustc_ast::{AttrStyle, AttrVec, Attribute, MacCall, MacStmtStyle};
+use rustc_ast::{Block, BlockCheckMode, Expr, ExprKind, Local, Stmt, StmtKind, DUMMY_NODE_ID};
 use rustc_errors::{Applicability, PResult};
 use rustc_span::source_map::{BytePos, Span};
 use rustc_span::symbol::{kw, sym};
@@ -21,7 +21,7 @@ use std::mem;
 impl<'a> Parser<'a> {
     /// Parses a statement. This stops just before trailing semicolons on everything but items.
     /// e.g., a `StmtKind::Semi` parses to a `StmtKind::Expr`, leaving the trailing `;` unconsumed.
-    pub fn parse_stmt(&mut self) -> PResult<'a, Option<Stmt>> {
+    pub(super) fn parse_stmt(&mut self) -> PResult<'a, Option<Stmt>> {
         Ok(self.parse_stmt_without_recovery().unwrap_or_else(|mut e| {
             e.emit();
             self.recover_stmt_(SemiColonMode::Break, BlockMode::Ignore);
@@ -79,7 +79,7 @@ impl<'a> Parser<'a> {
         }
 
         let expr = if self.check(&token::OpenDelim(token::Brace)) {
-            self.parse_struct_expr(lo, path, AttrVec::new())?
+            self.parse_struct_expr(path, AttrVec::new())?
         } else {
             let hi = self.prev_token.span;
             self.mk_expr(lo.to(hi), ExprKind::Path(None, path), AttrVec::new())
@@ -162,13 +162,19 @@ impl<'a> Parser<'a> {
             match self.parse_ty() {
                 Ok(ty) => (None, Some(ty)),
                 Err(mut err) => {
-                    // Rewind to before attempting to parse the type and continue parsing.
-                    let parser_snapshot_after_type = self.clone();
-                    mem::replace(self, parser_snapshot_before_type);
                     if let Ok(snip) = self.span_to_snippet(pat.span) {
                         err.span_label(pat.span, format!("while parsing the type for `{}`", snip));
                     }
-                    (Some((parser_snapshot_after_type, colon_sp, err)), None)
+                    let err = if self.check(&token::Eq) {
+                        err.emit();
+                        None
+                    } else {
+                        // Rewind to before attempting to parse the type and continue parsing.
+                        let parser_snapshot_after_type =
+                            mem::replace(self, parser_snapshot_before_type);
+                        Some((parser_snapshot_after_type, colon_sp, err))
+                    };
+                    (err, None)
                 }
             }
         } else {
@@ -201,7 +207,7 @@ impl<'a> Parser<'a> {
                 // Couldn't parse the type nor the initializer, only raise the type error and
                 // return to the parser state before parsing the type as the initializer.
                 // let x: <parse_error>;
-                mem::replace(self, snapshot);
+                *self = snapshot;
                 return Err(ty_err);
             }
             (Err(err), None) => {
@@ -216,12 +222,32 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses the RHS of a local variable declaration (e.g., '= 14;').
-    fn parse_initializer(&mut self, skip_eq: bool) -> PResult<'a, Option<P<Expr>>> {
-        if self.eat(&token::Eq) || skip_eq { Ok(Some(self.parse_expr()?)) } else { Ok(None) }
+    fn parse_initializer(&mut self, eq_optional: bool) -> PResult<'a, Option<P<Expr>>> {
+        let eq_consumed = match self.token.kind {
+            token::BinOpEq(..) => {
+                // Recover `let x <op>= 1` as `let x = 1`
+                self.struct_span_err(
+                    self.token.span,
+                    "can't reassign to an uninitialized variable",
+                )
+                .span_suggestion_short(
+                    self.token.span,
+                    "initialize the variable",
+                    "=".to_string(),
+                    Applicability::MaybeIncorrect,
+                )
+                .emit();
+                self.bump();
+                true
+            }
+            _ => self.eat(&token::Eq),
+        };
+
+        Ok(if eq_consumed || eq_optional { Some(self.parse_expr()?) } else { None })
     }
 
     /// Parses a block. No inner attributes are allowed.
-    pub fn parse_block(&mut self) -> PResult<'a, P<Block>> {
+    pub(super) fn parse_block(&mut self) -> PResult<'a, P<Block>> {
         let (attrs, block) = self.parse_inner_attrs_and_block()?;
         if let [.., last] = &*attrs {
             self.error_on_forbidden_inner_attr(last.span, DEFAULT_INNER_ATTR_FORBIDDEN);

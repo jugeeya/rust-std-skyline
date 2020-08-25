@@ -1,6 +1,6 @@
 use crate::ich::StableHashingContext;
 use crate::ty::{self, Ty, TyCtxt};
-use rustc_ast::ast;
+use rustc_ast as ast;
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 use rustc_hir::def_id::DefId;
 use std::fmt::Debug;
@@ -17,7 +17,7 @@ pub type SimplifiedType = SimplifiedTypeGen<DefId>;
 /// because we sometimes need to use SimplifiedTypeGen values as stable sorting
 /// keys (in which case we use a DefPathHash as id-type) but in the general case
 /// the non-stable but fast to construct DefId-version is the better choice.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, RustcEncodable, RustcDecodable)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, TyEncodable, TyDecodable)]
 pub enum SimplifiedTypeGen<D>
 where
     D: Copy + Debug + Ord + Eq,
@@ -90,7 +90,6 @@ pub fn simplify_type(
         ty::Never => Some(NeverSimplifiedType),
         ty::Tuple(ref tys) => Some(TupleSimplifiedType(tys.len())),
         ty::FnPtr(ref f) => Some(FunctionSimplifiedType(f.skip_binder().inputs().len())),
-        ty::UnnormalizedProjection(..) => bug!("only used with chalk-engine"),
         ty::Projection(_) | ty::Param(_) => {
             if can_simplify_params {
                 // In normalized types, projections don't unify with
@@ -105,7 +104,7 @@ pub fn simplify_type(
         }
         ty::Opaque(def_id, _) => Some(OpaqueSimplifiedType(def_id)),
         ty::Foreign(def_id) => Some(ForeignSimplifiedType(def_id)),
-        ty::Placeholder(..) | ty::Bound(..) | ty::Infer(_) | ty::Error => None,
+        ty::Placeholder(..) | ty::Bound(..) | ty::Infer(_) | ty::Error(_) => None,
     }
 }
 

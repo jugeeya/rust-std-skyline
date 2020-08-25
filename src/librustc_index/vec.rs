@@ -65,7 +65,7 @@ impl Idx for u32 {
 /// `u32::MAX`. You can also customize things like the `Debug` impl,
 /// what traits are derived, and so forth via the macro.
 #[macro_export]
-#[allow_internal_unstable(step_trait, rustc_attrs)]
+#[allow_internal_unstable(step_trait, step_trait_ext, rustc_attrs)]
 macro_rules! newtype_index {
     // ---- public rules ----
 
@@ -181,7 +181,7 @@ macro_rules! newtype_index {
             }
         }
 
-        impl ::std::iter::Step for $type {
+        unsafe impl ::std::iter::Step for $type {
             #[inline]
             fn steps_between(start: &Self, end: &Self) -> Option<usize> {
                 <usize as ::std::iter::Step>::steps_between(
@@ -191,33 +191,13 @@ macro_rules! newtype_index {
             }
 
             #[inline]
-            fn replace_one(&mut self) -> Self {
-                ::std::mem::replace(self, Self::from_u32(1))
+            fn forward_checked(start: Self, u: usize) -> Option<Self> {
+                Self::index(start).checked_add(u).map(Self::from_usize)
             }
 
             #[inline]
-            fn replace_zero(&mut self) -> Self {
-                ::std::mem::replace(self, Self::from_u32(0))
-            }
-
-            #[inline]
-            fn add_one(&self) -> Self {
-                Self::from_usize(Self::index(*self) + 1)
-            }
-
-            #[inline]
-            fn sub_one(&self) -> Self {
-                Self::from_usize(Self::index(*self) - 1)
-            }
-
-            #[inline]
-            fn add_usize(&self, u: usize) -> Option<Self> {
-                Self::index(*self).checked_add(u).map(Self::from_usize)
-            }
-
-            #[inline]
-            fn sub_usize(&self, u: usize) -> Option<Self> {
-                Self::index(*self).checked_sub(u).map(Self::from_usize)
+            fn backward_checked(start: Self, u: usize) -> Option<Self> {
+                Self::index(start).checked_sub(u).map(Self::from_usize)
             }
         }
 
@@ -340,14 +320,14 @@ macro_rules! newtype_index {
                    derive [$($derives:ident,)+]
                    $($tokens:tt)*) => (
         $crate::newtype_index!(
-            @derives      [$($derives,)+ RustcEncodable,]
+            @derives      [$($derives,)+]
             @attrs        [$(#[$attrs])*]
             @type         [$type]
             @max          [$max]
             @vis          [$v]
             @debug_format [$debug_format]
                           $($tokens)*);
-        $crate::newtype_index!(@decodable $type);
+        $crate::newtype_index!(@serializable $type);
     );
 
     // The case where no derives are added, but encodable is overridden. Don't
@@ -377,20 +357,25 @@ macro_rules! newtype_index {
      @debug_format [$debug_format:tt]
                    $($tokens:tt)*) => (
         $crate::newtype_index!(
-            @derives      [RustcEncodable,]
+            @derives      []
             @attrs        [$(#[$attrs])*]
             @type         [$type]
             @max          [$max]
             @vis          [$v]
             @debug_format [$debug_format]
                           $($tokens)*);
-        $crate::newtype_index!(@decodable $type);
+        $crate::newtype_index!(@serializable $type);
     );
 
-    (@decodable $type:ident) => (
-        impl ::rustc_serialize::Decodable for $type {
-            fn decode<D: ::rustc_serialize::Decoder>(d: &mut D) -> Result<Self, D::Error> {
+    (@serializable $type:ident) => (
+        impl<D: ::rustc_serialize::Decoder> ::rustc_serialize::Decodable<D> for $type {
+            fn decode(d: &mut D) -> Result<Self, D::Error> {
                 d.read_u32().map(Self::from_u32)
+            }
+        }
+        impl<E: ::rustc_serialize::Encoder> ::rustc_serialize::Encodable<E> for $type {
+            fn encode(&self, e: &mut E) -> Result<(), E::Error> {
+                e.emit_u32(self.private)
             }
         }
     );
@@ -503,14 +488,20 @@ pub struct IndexVec<I: Idx, T> {
 // not the phantom data.
 unsafe impl<I: Idx, T> Send for IndexVec<I, T> where T: Send {}
 
-impl<I: Idx, T: Encodable> Encodable for IndexVec<I, T> {
-    fn encode<S: Encoder>(&self, s: &mut S) -> Result<(), S::Error> {
+impl<S: Encoder, I: Idx, T: Encodable<S>> Encodable<S> for IndexVec<I, T> {
+    fn encode(&self, s: &mut S) -> Result<(), S::Error> {
         Encodable::encode(&self.raw, s)
     }
 }
 
-impl<I: Idx, T: Decodable> Decodable for IndexVec<I, T> {
-    fn decode<D: Decoder>(d: &mut D) -> Result<Self, D::Error> {
+impl<S: Encoder, I: Idx, T: Encodable<S>> Encodable<S> for &IndexVec<I, T> {
+    fn encode(&self, s: &mut S) -> Result<(), S::Error> {
+        Encodable::encode(&self.raw, s)
+    }
+}
+
+impl<D: Decoder, I: Idx, T: Decodable<D>> Decodable<D> for IndexVec<I, T> {
+    fn decode(d: &mut D) -> Result<Self, D::Error> {
         Decodable::decode(d).map(|v| IndexVec { raw: v, _marker: PhantomData })
     }
 }
@@ -556,7 +547,8 @@ impl<I: Idx, T> IndexVec<I, T> {
     }
 
     /// Create an `IndexVec` with `n` elements, where the value of each
-    /// element is the result of `func(i)`
+    /// element is the result of `func(i)`. (The underlying vector will
+    /// be allocated only once, with a capacity of at least `n`.)
     #[inline]
     pub fn from_fn_n(func: impl FnMut(I) -> T, n: usize) -> Self {
         let indices = (0..n).map(I::new);
@@ -688,6 +680,17 @@ impl<I: Idx, T> IndexVec<I, T> {
         }
     }
 
+    /// Returns mutable references to three distinct elements or panics otherwise.
+    #[inline]
+    pub fn pick3_mut(&mut self, a: I, b: I, c: I) -> (&mut T, &mut T, &mut T) {
+        let (ai, bi, ci) = (a.index(), b.index(), c.index());
+        assert!(ai != bi && bi != ci && ci != ai);
+        let len = self.raw.len();
+        assert!(ai < len && bi < len && ci < len);
+        let ptr = self.raw.as_mut_ptr();
+        unsafe { (&mut *ptr.add(ai), &mut *ptr.add(bi), &mut *ptr.add(ci)) }
+    }
+
     pub fn convert_index_type<Ix: Idx>(self) -> IndexVec<Ix, T> {
         IndexVec { raw: self.raw, _marker: PhantomData }
     }
@@ -755,6 +758,16 @@ impl<I: Idx, T> Extend<T> for IndexVec<I, T> {
     #[inline]
     fn extend<J: IntoIterator<Item = T>>(&mut self, iter: J) {
         self.raw.extend(iter);
+    }
+
+    #[inline]
+    fn extend_one(&mut self, item: T) {
+        self.raw.push(item);
+    }
+
+    #[inline]
+    fn extend_reserve(&mut self, additional: usize) {
+        self.raw.reserve(additional);
     }
 }
 

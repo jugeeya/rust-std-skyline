@@ -4,8 +4,8 @@
 pub use self::StabilityLevel::*;
 
 use crate::ty::{self, TyCtxt};
-use rustc_ast::ast::CRATE_NODE_ID;
-use rustc_attr::{self as attr, ConstStability, Deprecation, RustcDeprecation, Stability};
+use rustc_ast::CRATE_NODE_ID;
+use rustc_attr::{self as attr, ConstStability, Deprecation, Stability};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_errors::{Applicability, DiagnosticBuilder};
 use rustc_feature::GateIssue;
@@ -130,14 +130,26 @@ pub fn report_unstable(
 
 /// Checks whether an item marked with `deprecated(since="X")` is currently
 /// deprecated (i.e., whether X is not greater than the current rustc version).
-pub fn deprecation_in_effect(since: &str) -> bool {
+pub fn deprecation_in_effect(is_since_rustc_version: bool, since: Option<&str>) -> bool {
+    let since = if let Some(since) = since {
+        if is_since_rustc_version {
+            since
+        } else {
+            // We assume that the deprecation is in effect if it's not a
+            // rustc version.
+            return true;
+        }
+    } else {
+        // If since attribute is not set, then we're definitely in effect.
+        return true;
+    };
     fn parse_version(ver: &str) -> Vec<u32> {
         // We ignore non-integer components of the version (e.g., "nightly").
         ver.split(|c| c == '.' || c == '-').flat_map(|s| s.parse()).collect()
     }
 
     if let Some(rustc) = option_env!("CFG_RELEASE") {
-        let since: Vec<u32> = parse_version(since);
+        let since: Vec<u32> = parse_version(&since);
         let rustc: Vec<u32> = parse_version(rustc);
         // We simply treat invalid `since` attributes as relating to a previous
         // Rust version, thus always displaying the warning.
@@ -154,44 +166,42 @@ pub fn deprecation_in_effect(since: &str) -> bool {
 
 pub fn deprecation_suggestion(
     diag: &mut DiagnosticBuilder<'_>,
+    kind: &str,
     suggestion: Option<Symbol>,
     span: Span,
 ) {
     if let Some(suggestion) = suggestion {
         diag.span_suggestion(
             span,
-            "replace the use of the deprecated item",
+            &format!("replace the use of the deprecated {}", kind),
             suggestion.to_string(),
             Applicability::MachineApplicable,
         );
     }
 }
 
-fn deprecation_message_common(message: String, reason: Option<Symbol>) -> String {
-    match reason {
-        Some(reason) => format!("{}: {}", message, reason),
-        None => message,
-    }
-}
-
-pub fn deprecation_message(depr: &Deprecation, path: &str) -> (String, &'static Lint) {
-    let message = format!("use of deprecated item '{}'", path);
-    (deprecation_message_common(message, depr.note), DEPRECATED)
-}
-
-pub fn rustc_deprecation_message(depr: &RustcDeprecation, path: &str) -> (String, &'static Lint) {
-    let (message, lint) = if deprecation_in_effect(&depr.since.as_str()) {
-        (format!("use of deprecated item '{}'", path), DEPRECATED)
+pub fn deprecation_message(depr: &Deprecation, kind: &str, path: &str) -> (String, &'static Lint) {
+    let (message, lint) = if deprecation_in_effect(
+        depr.is_since_rustc_version,
+        depr.since.map(Symbol::as_str).as_deref(),
+    ) {
+        (format!("use of deprecated {} `{}`", kind, path), DEPRECATED)
     } else {
         (
             format!(
-                "use of item '{}' that will be deprecated in future version {}",
-                path, depr.since
+                "use of {} `{}` that will be deprecated in future version {}",
+                kind,
+                path,
+                depr.since.unwrap()
             ),
             DEPRECATED_IN_FUTURE,
         )
     };
-    (deprecation_message_common(message, Some(depr.reason)), lint)
+    let message = match depr.note {
+        Some(reason) => format!("{}: {}", message, reason),
+        None => message,
+    };
+    (message, lint)
 }
 
 pub fn early_report_deprecation(
@@ -215,8 +225,8 @@ fn late_report_deprecation(
     suggestion: Option<Symbol>,
     lint: &'static Lint,
     span: Span,
-    def_id: DefId,
     hir_id: HirId,
+    def_id: DefId,
 ) {
     if span.in_derive_expansion() {
         return;
@@ -225,13 +235,11 @@ fn late_report_deprecation(
     tcx.struct_span_lint_hir(lint, hir_id, span, |lint| {
         let mut diag = lint.build(message);
         if let hir::Node::Expr(_) = tcx.hir().get(hir_id) {
-            deprecation_suggestion(&mut diag, suggestion, span);
+            let kind = tcx.def_kind(def_id).descr(def_id);
+            deprecation_suggestion(&mut diag, kind, suggestion, span);
         }
         diag.emit()
     });
-    if hir_id == hir::DUMMY_HIR_ID {
-        span_bug!(span, "emitted a {} lint with dummy HIR id: {:?}", lint.name, def_id);
-    }
 }
 
 /// Result of `TyCtxt::eval_stability`.
@@ -250,7 +258,7 @@ pub enum EvalResult {
 fn skip_stability_check_due_to_privacy(tcx: TyCtxt<'_>, mut def_id: DefId) -> bool {
     // Check if `def_id` is a trait method.
     match tcx.def_kind(def_id) {
-        Some(DefKind::AssocFn) | Some(DefKind::AssocTy) | Some(DefKind::AssocConst) => {
+        DefKind::AssocFn | DefKind::AssocTy | DefKind::AssocConst => {
             if let ty::TraitContainer(trait_def_id) = tcx.associated_item(def_id).container {
                 // Trait methods do not declare visibility (even
                 // for visibility info in cstore). Use containing
@@ -290,13 +298,28 @@ impl<'tcx> TyCtxt<'tcx> {
             if let Some(depr_entry) = self.lookup_deprecation_entry(def_id) {
                 let parent_def_id = self.hir().local_def_id(self.hir().get_parent_item(id));
                 let skip = self
-                    .lookup_deprecation_entry(parent_def_id)
+                    .lookup_deprecation_entry(parent_def_id.to_def_id())
                     .map_or(false, |parent_depr| parent_depr.same_origin(&depr_entry));
 
-                if !skip {
-                    let (message, lint) =
-                        deprecation_message(&depr_entry.attr, &self.def_path_str(def_id));
-                    late_report_deprecation(self, &message, None, lint, span, def_id, id);
+                // #[deprecated] doesn't emit a notice if we're not on the
+                // topmost deprecation. For example, if a struct is deprecated,
+                // the use of a field won't be linted.
+                //
+                // #[rustc_deprecated] however wants to emit down the whole
+                // hierarchy.
+                if !skip || depr_entry.attr.is_since_rustc_version {
+                    let path = &self.def_path_str(def_id);
+                    let kind = self.def_kind(def_id).descr(def_id);
+                    let (message, lint) = deprecation_message(&depr_entry.attr, kind, path);
+                    late_report_deprecation(
+                        self,
+                        &message,
+                        depr_entry.attr.suggestion,
+                        lint,
+                        span,
+                        id,
+                        def_id,
+                    );
                 }
             };
         }
@@ -313,24 +336,6 @@ impl<'tcx> TyCtxt<'tcx> {
                 inspecting def_id={:?} span={:?} of stability={:?}",
             def_id, span, stability
         );
-
-        if let Some(id) = id {
-            if let Some(stability) = stability {
-                if let Some(depr) = &stability.rustc_depr {
-                    let (message, lint) =
-                        rustc_deprecation_message(depr, &self.def_path_str(def_id));
-                    late_report_deprecation(
-                        self,
-                        &message,
-                        depr.suggestion,
-                        lint,
-                        span,
-                        def_id,
-                        id,
-                    );
-                }
-            }
-        }
 
         // Only the cross-crate scenario matters when checking unstable APIs
         let cross_crate = !def_id.is_local();

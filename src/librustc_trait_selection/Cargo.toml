@@ -10,8 +10,8 @@ path = "lib.rs"
 doctest = false
 
 [dependencies]
-fmt_macros = { path = "../libfmt_macros" }
-log = { version = "0.4", features = ["release_max_level_info", "std"] }
+rustc_parse_format = { path = "../librustc_parse_format" }
+tracing = "0.1"
 rustc_attr = { path = "../librustc_attr" }
 rustc_middle = { path = "../librustc_middle" }
 rustc_ast = { path = "../librustc_ast" }

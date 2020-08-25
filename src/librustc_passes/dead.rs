@@ -15,8 +15,8 @@ use rustc_middle::middle::privacy;
 use rustc_middle::ty::{self, DefIdTree, TyCtxt};
 use rustc_session::lint;
 
-use rustc_ast::{ast, attr};
-use rustc_span::symbol::sym;
+use rustc_ast as ast;
+use rustc_span::symbol::{sym, Symbol};
 
 // Any local node that may call something in its body block should be
 // explored. For example, if it's a live Node::Item that is a
@@ -24,21 +24,23 @@ use rustc_span::symbol::sym;
 // may need to be marked as live.
 fn should_explore(tcx: TyCtxt<'_>, hir_id: hir::HirId) -> bool {
     match tcx.hir().find(hir_id) {
-        Some(Node::Item(..))
-        | Some(Node::ImplItem(..))
-        | Some(Node::ForeignItem(..))
-        | Some(Node::TraitItem(..))
-        | Some(Node::Variant(..))
-        | Some(Node::AnonConst(..))
-        | Some(Node::Pat(..)) => true,
+        Some(
+            Node::Item(..)
+            | Node::ImplItem(..)
+            | Node::ForeignItem(..)
+            | Node::TraitItem(..)
+            | Node::Variant(..)
+            | Node::AnonConst(..)
+            | Node::Pat(..),
+        ) => true,
         _ => false,
     }
 }
 
-struct MarkSymbolVisitor<'a, 'tcx> {
+struct MarkSymbolVisitor<'tcx> {
     worklist: Vec<hir::HirId>,
     tcx: TyCtxt<'tcx>,
-    tables: &'a ty::TypeckTables<'tcx>,
+    maybe_typeck_results: Option<&'tcx ty::TypeckResults<'tcx>>,
     live_symbols: FxHashSet<hir::HirId>,
     repr_has_repr_c: bool,
     in_pat: bool,
@@ -48,9 +50,19 @@ struct MarkSymbolVisitor<'a, 'tcx> {
     struct_constructors: FxHashMap<hir::HirId, hir::HirId>,
 }
 
-impl<'a, 'tcx> MarkSymbolVisitor<'a, 'tcx> {
+impl<'tcx> MarkSymbolVisitor<'tcx> {
+    /// Gets the type-checking results for the current body.
+    /// As this will ICE if called outside bodies, only call when working with
+    /// `Expr` or `Pat` nodes (they are guaranteed to be found only in bodies).
+    #[track_caller]
+    fn typeck_results(&self) -> &'tcx ty::TypeckResults<'tcx> {
+        self.maybe_typeck_results
+            .expect("`MarkSymbolVisitor::typeck_results` called outside of body")
+    }
+
     fn check_def_id(&mut self, def_id: DefId) {
-        if let Some(hir_id) = self.tcx.hir().as_local_hir_id(def_id) {
+        if let Some(def_id) = def_id.as_local() {
+            let hir_id = self.tcx.hir().local_def_id_to_hir_id(def_id);
             if should_explore(self.tcx, hir_id) || self.struct_constructors.contains_key(&hir_id) {
                 self.worklist.push(hir_id);
             }
@@ -59,7 +71,8 @@ impl<'a, 'tcx> MarkSymbolVisitor<'a, 'tcx> {
     }
 
     fn insert_def_id(&mut self, def_id: DefId) {
-        if let Some(hir_id) = self.tcx.hir().as_local_hir_id(def_id) {
+        if let Some(def_id) = def_id.as_local() {
+            let hir_id = self.tcx.hir().local_def_id_to_hir_id(def_id);
             debug_assert!(!should_explore(self.tcx, hir_id));
             self.live_symbols.insert(hir_id);
         }
@@ -67,9 +80,7 @@ impl<'a, 'tcx> MarkSymbolVisitor<'a, 'tcx> {
 
     fn handle_res(&mut self, res: Res) {
         match res {
-            Res::Def(DefKind::Const, _)
-            | Res::Def(DefKind::AssocConst, _)
-            | Res::Def(DefKind::TyAlias, _) => {
+            Res::Def(DefKind::Const | DefKind::AssocConst | DefKind::TyAlias, _) => {
                 self.check_def_id(res.def_id());
             }
             _ if self.in_pat => {}
@@ -105,7 +116,7 @@ impl<'a, 'tcx> MarkSymbolVisitor<'a, 'tcx> {
     }
 
     fn lookup_and_handle_method(&mut self, id: hir::HirId) {
-        if let Some(def_id) = self.tables.type_dependent_def_id(id) {
+        if let Some(def_id) = self.typeck_results().type_dependent_def_id(id) {
             self.check_def_id(def_id);
         } else {
             bug!("no type-dependent def for method");
@@ -113,9 +124,9 @@ impl<'a, 'tcx> MarkSymbolVisitor<'a, 'tcx> {
     }
 
     fn handle_field_access(&mut self, lhs: &hir::Expr<'_>, hir_id: hir::HirId) {
-        match self.tables.expr_ty_adjusted(lhs).kind {
+        match self.typeck_results().expr_ty_adjusted(lhs).kind {
             ty::Adt(def, _) => {
-                let index = self.tcx.field_index(hir_id, self.tables);
+                let index = self.tcx.field_index(hir_id, self.typeck_results());
                 self.insert_def_id(def.non_enum_variant().fields[index].did);
             }
             ty::Tuple(..) => {}
@@ -129,7 +140,7 @@ impl<'a, 'tcx> MarkSymbolVisitor<'a, 'tcx> {
         res: Res,
         pats: &[hir::FieldPat<'_>],
     ) {
-        let variant = match self.tables.node_type(lhs.hir_id).kind {
+        let variant = match self.typeck_results().node_type(lhs.hir_id).kind {
             ty::Adt(adt, _) => adt.variant_of_res(res),
             _ => span_bug!(lhs.span, "non-ADT in struct pattern"),
         };
@@ -137,7 +148,7 @@ impl<'a, 'tcx> MarkSymbolVisitor<'a, 'tcx> {
             if let PatKind::Wild = pat.pat.kind {
                 continue;
             }
-            let index = self.tcx.field_index(pat.hir_id, self.tables);
+            let index = self.tcx.field_index(pat.hir_id, self.typeck_results());
             self.insert_def_id(variant.fields[index].did);
         }
     }
@@ -202,14 +213,14 @@ impl<'a, 'tcx> MarkSymbolVisitor<'a, 'tcx> {
     fn mark_as_used_if_union(&mut self, adt: &ty::AdtDef, fields: &[hir::Field<'_>]) {
         if adt.is_union() && adt.non_enum_variant().fields.len() > 1 && adt.did.is_local() {
             for field in fields {
-                let index = self.tcx.field_index(field.hir_id, self.tables);
+                let index = self.tcx.field_index(field.hir_id, self.typeck_results());
                 self.insert_def_id(adt.non_enum_variant().fields[index].did);
             }
         }
     }
 }
 
-impl<'a, 'tcx> Visitor<'tcx> for MarkSymbolVisitor<'a, 'tcx> {
+impl<'tcx> Visitor<'tcx> for MarkSymbolVisitor<'tcx> {
     type Map = intravisit::ErasedMap<'tcx>;
 
     fn nested_visit_map(&mut self) -> intravisit::NestedVisitorMap<Self::Map> {
@@ -217,17 +228,17 @@ impl<'a, 'tcx> Visitor<'tcx> for MarkSymbolVisitor<'a, 'tcx> {
     }
 
     fn visit_nested_body(&mut self, body: hir::BodyId) {
-        let old_tables = self.tables;
-        self.tables = self.tcx.body_tables(body);
+        let old_maybe_typeck_results =
+            self.maybe_typeck_results.replace(self.tcx.typeck_body(body));
         let body = self.tcx.hir().body(body);
         self.visit_body(body);
-        self.tables = old_tables;
+        self.maybe_typeck_results = old_maybe_typeck_results;
     }
 
     fn visit_variant_data(
         &mut self,
         def: &'tcx hir::VariantData<'tcx>,
-        _: ast::Name,
+        _: Symbol,
         _: &hir::Generics<'_>,
         _: hir::HirId,
         _: rustc_span::Span,
@@ -246,7 +257,7 @@ impl<'a, 'tcx> Visitor<'tcx> for MarkSymbolVisitor<'a, 'tcx> {
     fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
         match expr.kind {
             hir::ExprKind::Path(ref qpath @ hir::QPath::TypeRelative(..)) => {
-                let res = self.tables.qpath_res(qpath, expr.hir_id);
+                let res = self.typeck_results().qpath_res(qpath, expr.hir_id);
                 self.handle_res(res);
             }
             hir::ExprKind::MethodCall(..) => {
@@ -255,8 +266,10 @@ impl<'a, 'tcx> Visitor<'tcx> for MarkSymbolVisitor<'a, 'tcx> {
             hir::ExprKind::Field(ref lhs, ..) => {
                 self.handle_field_access(&lhs, expr.hir_id);
             }
-            hir::ExprKind::Struct(_, ref fields, _) => {
-                if let ty::Adt(ref adt, _) = self.tables.expr_ty(expr).kind {
+            hir::ExprKind::Struct(ref qpath, ref fields, _) => {
+                let res = self.typeck_results().qpath_res(qpath, expr.hir_id);
+                self.handle_res(res);
+                if let ty::Adt(ref adt, _) = self.typeck_results().expr_ty(expr).kind {
                     self.mark_as_used_if_union(adt, fields);
                 }
             }
@@ -279,11 +292,11 @@ impl<'a, 'tcx> Visitor<'tcx> for MarkSymbolVisitor<'a, 'tcx> {
     fn visit_pat(&mut self, pat: &'tcx hir::Pat<'tcx>) {
         match pat.kind {
             PatKind::Struct(ref path, ref fields, _) => {
-                let res = self.tables.qpath_res(path, pat.hir_id);
+                let res = self.typeck_results().qpath_res(path, pat.hir_id);
                 self.handle_field_pattern_match(pat, res, fields);
             }
             PatKind::Path(ref qpath) => {
-                let res = self.tables.qpath_res(qpath, pat.hir_id);
+                let res = self.typeck_results().qpath_res(qpath, pat.hir_id);
                 self.handle_res(res);
             }
             _ => (),
@@ -300,7 +313,7 @@ impl<'a, 'tcx> Visitor<'tcx> for MarkSymbolVisitor<'a, 'tcx> {
     }
 
     fn visit_ty(&mut self, ty: &'tcx hir::Ty<'tcx>) {
-        if let TyKind::Def(item_id, _) = ty.kind {
+        if let TyKind::OpaqueDef(item_id, _) = ty.kind {
             let item = self.tcx.hir().expect_item(item_id.id);
             intravisit::walk_item(self, item);
         }
@@ -318,17 +331,17 @@ fn has_allow_dead_code_or_lang_attr(
     id: hir::HirId,
     attrs: &[ast::Attribute],
 ) -> bool {
-    if attr::contains_name(attrs, sym::lang) {
+    if tcx.sess.contains_name(attrs, sym::lang) {
         return true;
     }
 
     // Stable attribute for #[lang = "panic_impl"]
-    if attr::contains_name(attrs, sym::panic_handler) {
+    if tcx.sess.contains_name(attrs, sym::panic_handler) {
         return true;
     }
 
     // (To be) stable attribute for #[lang = "oom"]
-    if attr::contains_name(attrs, sym::alloc_error_handler) {
+    if tcx.sess.contains_name(attrs, sym::alloc_error_handler) {
         return true;
     }
 
@@ -448,7 +461,7 @@ fn create_and_seed_worklist<'tcx>(
         )
         .chain(
             // Seed entry point
-            tcx.entry_fn(LOCAL_CRATE).map(|(def_id, _)| tcx.hir().as_local_hir_id(def_id).unwrap()),
+            tcx.entry_fn(LOCAL_CRATE).map(|(def_id, _)| tcx.hir().local_def_id_to_hir_id(def_id)),
         )
         .collect::<Vec<_>>();
 
@@ -469,7 +482,7 @@ fn find_live<'tcx>(
     let mut symbol_visitor = MarkSymbolVisitor {
         worklist,
         tcx,
-        tables: &ty::TypeckTables::empty(None),
+        maybe_typeck_results: None,
         live_symbols: Default::default(),
         repr_has_repr_c: false,
         in_pat: false,
@@ -532,7 +545,8 @@ impl DeadVisitor<'tcx> {
         let inherent_impls = self.tcx.inherent_impls(def_id);
         for &impl_did in inherent_impls.iter() {
             for &item_did in &self.tcx.associated_item_def_ids(impl_did)[..] {
-                if let Some(item_hir_id) = self.tcx.hir().as_local_hir_id(item_did) {
+                if let Some(did) = item_did.as_local() {
+                    let item_hir_id = self.tcx.hir().local_def_id_to_hir_id(did);
                     if self.live_symbols.contains(&item_hir_id) {
                         return true;
                     }
@@ -546,13 +560,14 @@ impl DeadVisitor<'tcx> {
         &mut self,
         id: hir::HirId,
         span: rustc_span::Span,
-        name: ast::Name,
-        node_type: &str,
+        name: Symbol,
         participle: &str,
     ) {
         if !name.as_str().starts_with('_') {
             self.tcx.struct_span_lint_hir(lint::builtin::DEAD_CODE, id, span, |lint| {
-                lint.build(&format!("{} is never {}: `{}`", node_type, participle, name)).emit()
+                let def_id = self.tcx.hir().local_def_id(id);
+                let descr = self.tcx.def_kind(def_id).descr(def_id.to_def_id());
+                lint.build(&format!("{} is never {}: `{}`", descr, participle, name)).emit()
             });
         }
     }
@@ -583,7 +598,7 @@ impl Visitor<'tcx> for DeadVisitor<'tcx> {
                     // FIXME(66095): Because item.span is annotated with things
                     // like expansion data, and ident.span isn't, we use the
                     // def_span method if it's part of a macro invocation
-                    // (and thus has asource_callee set).
+                    // (and thus has a source_callee set).
                     // We should probably annotate ident.span with the macro
                     // context, but that's a larger change.
                     if item.span.source_callee().is_some() {
@@ -598,7 +613,7 @@ impl Visitor<'tcx> for DeadVisitor<'tcx> {
                 hir::ItemKind::Struct(..) => "constructed", // Issue #52325
                 _ => "used",
             };
-            self.warn_dead_code(item.hir_id, span, item.ident.name, item.kind.descr(), participle);
+            self.warn_dead_code(item.hir_id, span, item.ident.name, participle);
         } else {
             // Only continue if we didn't warn
             intravisit::walk_item(self, item);
@@ -612,13 +627,7 @@ impl Visitor<'tcx> for DeadVisitor<'tcx> {
         id: hir::HirId,
     ) {
         if self.should_warn_about_variant(&variant) {
-            self.warn_dead_code(
-                variant.id,
-                variant.span,
-                variant.ident.name,
-                "variant",
-                "constructed",
-            );
+            self.warn_dead_code(variant.id, variant.span, variant.ident.name, "constructed");
         } else {
             intravisit::walk_variant(self, variant, g, id);
         }
@@ -626,20 +635,14 @@ impl Visitor<'tcx> for DeadVisitor<'tcx> {
 
     fn visit_foreign_item(&mut self, fi: &'tcx hir::ForeignItem<'tcx>) {
         if self.should_warn_about_foreign_item(fi) {
-            self.warn_dead_code(
-                fi.hir_id,
-                fi.span,
-                fi.ident.name,
-                fi.kind.descriptive_variant(),
-                "used",
-            );
+            self.warn_dead_code(fi.hir_id, fi.span, fi.ident.name, "used");
         }
         intravisit::walk_foreign_item(self, fi);
     }
 
     fn visit_struct_field(&mut self, field: &'tcx hir::StructField<'tcx>) {
         if self.should_warn_about_field(&field) {
-            self.warn_dead_code(field.hir_id, field.span, field.ident.name, "field", "read");
+            self.warn_dead_code(field.hir_id, field.span, field.ident.name, "read");
         }
         intravisit::walk_struct_field(self, field);
     }
@@ -652,7 +655,6 @@ impl Visitor<'tcx> for DeadVisitor<'tcx> {
                         impl_item.hir_id,
                         impl_item.span,
                         impl_item.ident.name,
-                        "associated const",
                         "used",
                     );
                 }
@@ -660,18 +662,22 @@ impl Visitor<'tcx> for DeadVisitor<'tcx> {
             }
             hir::ImplItemKind::Fn(_, body_id) => {
                 if !self.symbol_is_live(impl_item.hir_id) {
-                    let span = self.tcx.sess.source_map().guess_head_span(impl_item.span);
-                    self.warn_dead_code(
-                        impl_item.hir_id,
-                        span,
-                        impl_item.ident.name,
-                        "method",
-                        "used",
-                    );
+                    // FIXME(66095): Because impl_item.span is annotated with things
+                    // like expansion data, and ident.span isn't, we use the
+                    // def_span method if it's part of a macro invocation
+                    // (and thus has a source_callee set).
+                    // We should probably annotate ident.span with the macro
+                    // context, but that's a larger change.
+                    let span = if impl_item.span.source_callee().is_some() {
+                        self.tcx.sess.source_map().guess_head_span(impl_item.span)
+                    } else {
+                        impl_item.ident.span
+                    };
+                    self.warn_dead_code(impl_item.hir_id, span, impl_item.ident.name, "used");
                 }
                 self.visit_nested_body(body_id)
             }
-            hir::ImplItemKind::OpaqueTy(..) | hir::ImplItemKind::TyAlias(..) => {}
+            hir::ImplItemKind::TyAlias(..) => {}
         }
     }
 

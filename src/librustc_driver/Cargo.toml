@@ -11,8 +11,9 @@ crate-type = ["dylib"]
 
 [dependencies]
 lazy_static = "1.0"
-log = "0.4"
-env_logger = { version = "0.7", default-features = false }
+libc = "0.2"
+tracing = { version = "0.1.18", features = ["release_max_level_info"]  }
+tracing-subscriber = { version = "0.2.10", default-features = false, features = ["fmt", "env-filter", "smallvec", "parking_lot", "ansi"] }
 rustc_middle = { path = "../librustc_middle" }
 rustc_ast_pretty = { path = "../librustc_ast_pretty" }
 rustc_target = { path = "../librustc_target" }
@@ -31,7 +32,7 @@ rustc_codegen_ssa = { path = "../librustc_codegen_ssa" }
 rustc_session = { path = "../librustc_session" }
 rustc_error_codes = { path = "../librustc_error_codes" }
 rustc_interface = { path = "../librustc_interface" }
-rustc_serialize = { path = "../libserialize", package = "serialize" }
+rustc_serialize = { path = "../librustc_serialize" }
 rustc_ast = { path = "../librustc_ast" }
 rustc_span = { path = "../librustc_span" }
 

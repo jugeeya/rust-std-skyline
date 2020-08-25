@@ -4,6 +4,7 @@ pub use Primitive::*;
 use crate::spec::Target;
 
 use std::convert::{TryFrom, TryInto};
+use std::num::NonZeroUsize;
 use std::ops::{Add, AddAssign, Deref, Mul, Range, RangeInclusive, Sub};
 
 use rustc_index::vec::{Idx, IndexVec};
@@ -31,7 +32,7 @@ pub struct TargetDataLayout {
     /// Alignments for vector types.
     pub vector_align: Vec<(Size, AbiAndPrefAlign)>,
 
-    pub instruction_address_space: u32,
+    pub instruction_address_space: AddressSpace,
 }
 
 impl Default for TargetDataLayout {
@@ -55,7 +56,7 @@ impl Default for TargetDataLayout {
                 (Size::from_bits(64), AbiAndPrefAlign::new(align(64))),
                 (Size::from_bits(128), AbiAndPrefAlign::new(align(128))),
             ],
-            instruction_address_space: 0,
+            instruction_address_space: AddressSpace::DATA,
         }
     }
 }
@@ -64,7 +65,7 @@ impl TargetDataLayout {
     pub fn parse(target: &Target) -> Result<TargetDataLayout, String> {
         // Parse an address space index from a string.
         let parse_address_space = |s: &str, cause: &str| {
-            s.parse::<u32>().map_err(|err| {
+            s.parse::<u32>().map(AddressSpace).map_err(|err| {
                 format!("invalid address space `{}` for `{}` in \"data-layout\": {}", s, cause, err)
             })
         };
@@ -234,7 +235,7 @@ pub enum Endian {
 }
 
 /// Size of a type in bytes.
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, RustcEncodable, RustcDecodable)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Encodable, Decodable)]
 #[derive(HashStable_Generic)]
 pub struct Size {
     raw: u64,
@@ -357,7 +358,7 @@ impl AddAssign for Size {
 }
 
 /// Alignment of a type in bytes (always a power of two).
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, RustcEncodable, RustcDecodable)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Encodable, Decodable)]
 #[derive(HashStable_Generic)]
 pub struct Align {
     pow2: u8,
@@ -414,7 +415,7 @@ impl Align {
 }
 
 /// A pair of alignments, ABI-mandated and preferred.
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, RustcEncodable, RustcDecodable)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Encodable, Decodable)]
 #[derive(HashStable_Generic)]
 pub struct AbiAndPrefAlign {
     pub abi: Align,
@@ -619,10 +620,11 @@ impl Scalar {
 /// Describes how the fields of a type are located in memory.
 #[derive(PartialEq, Eq, Hash, Debug, HashStable_Generic)]
 pub enum FieldsShape {
+    /// Scalar primitives and `!`, which never have fields.
+    Primitive,
+
     /// All fields start at no offset. The `usize` is the field count.
-    ///
-    /// In the case of primitives the number of fields is `0`.
-    Union(usize),
+    Union(NonZeroUsize),
 
     /// Array/vector-like placement, with all fields of identical types.
     Array { stride: Size, count: u64 },
@@ -660,7 +662,8 @@ pub enum FieldsShape {
 impl FieldsShape {
     pub fn count(&self) -> usize {
         match *self {
-            FieldsShape::Union(count) => count,
+            FieldsShape::Primitive => 0,
+            FieldsShape::Union(count) => count.get(),
             FieldsShape::Array { count, .. } => {
                 let usize_count = count as usize;
                 assert_eq!(usize_count as u64, count);
@@ -672,8 +675,16 @@ impl FieldsShape {
 
     pub fn offset(&self, i: usize) -> Size {
         match *self {
+            FieldsShape::Primitive => {
+                unreachable!("FieldsShape::offset: `Primitive`s have no fields")
+            }
             FieldsShape::Union(count) => {
-                assert!(i < count, "tried to access field {} of union with {} fields", i, count);
+                assert!(
+                    i < count.get(),
+                    "tried to access field {} of union with {} fields",
+                    i,
+                    count
+                );
                 Size::ZERO
             }
             FieldsShape::Array { stride, count } => {
@@ -687,6 +698,9 @@ impl FieldsShape {
 
     pub fn memory_index(&self, i: usize) -> usize {
         match *self {
+            FieldsShape::Primitive => {
+                unreachable!("FieldsShape::memory_index: `Primitive`s have no fields")
+            }
             FieldsShape::Union(_) | FieldsShape::Array { .. } => i,
             FieldsShape::Arbitrary { ref memory_index, .. } => {
                 let r = memory_index[i];
@@ -718,7 +732,7 @@ impl FieldsShape {
         }
 
         (0..self.count()).map(move |i| match *self {
-            FieldsShape::Union(_) | FieldsShape::Array { .. } => i,
+            FieldsShape::Primitive | FieldsShape::Union(_) | FieldsShape::Array { .. } => i,
             FieldsShape::Arbitrary { .. } => {
                 if use_small {
                     inverse_small[i] as usize
@@ -728,6 +742,17 @@ impl FieldsShape {
             }
         })
     }
+}
+
+/// An identifier that specifies the address space that some operation
+/// should operate on. Special address spaces have an effect on code generation,
+/// depending on the target and the address spaces it implements.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AddressSpace(pub u32);
+
+impl AddressSpace {
+    /// The default address space, corresponding to data space.
+    pub const DATA: Self = AddressSpace(0);
 }
 
 /// Describes how values of the type are passed by target ABIs,
@@ -795,25 +820,30 @@ pub enum Variants {
     /// Single enum variants, structs/tuples, unions, and all non-ADTs.
     Single { index: VariantIdx },
 
-    /// Enum-likes with more than one inhabited variant: for each case there is
-    /// a struct, and they all have space reserved for the discriminant.
-    /// For enums this is the sole field of the layout.
+    /// Enum-likes with more than one inhabited variant: each variant comes with
+    /// a *discriminant* (usually the same as the variant index but the user can
+    /// assign explicit discriminant values).  That discriminant is encoded
+    /// as a *tag* on the machine.  The layout of each variant is
+    /// a struct, and they all have space reserved for the tag.
+    /// For enums, the tag is the sole field of the layout.
     Multiple {
-        discr: Scalar,
-        discr_kind: DiscriminantKind,
-        discr_index: usize,
+        tag: Scalar,
+        tag_encoding: TagEncoding,
+        tag_field: usize,
         variants: IndexVec<VariantIdx, Layout>,
     },
 }
 
 #[derive(PartialEq, Eq, Hash, Debug, HashStable_Generic)]
-pub enum DiscriminantKind {
-    /// Integer tag holding the discriminant value itself.
-    Tag,
+pub enum TagEncoding {
+    /// The tag directly stores the discriminant, but possibly with a smaller layout
+    /// (so converting the tag to the discriminant can require sign extension).
+    Direct,
 
     /// Niche (values invalid for a type) encoding the discriminant:
-    /// the variant `dataful_variant` contains a niche at an arbitrary
-    /// offset (field `discr_index` of the enum), which for a variant with
+    /// Discriminant and variant index coincide.
+    /// The variant `dataful_variant` contains a niche at an arbitrary
+    /// offset (field `tag_field` of the enum), which for a variant with
     /// discriminant `d` is set to
     /// `(d - niche_variants.start).wrapping_add(niche_start)`.
     ///
@@ -887,7 +917,6 @@ impl Niche {
 #[derive(PartialEq, Eq, Hash, Debug, HashStable_Generic)]
 pub struct Layout {
     /// Says where the fields are located within the layout.
-    /// Primitives and uninhabited enums appear as unions without fields.
     pub fields: FieldsShape,
 
     /// Encodes information about multi-variant layouts.
@@ -923,7 +952,7 @@ impl Layout {
         let align = scalar.value.align(cx);
         Layout {
             variants: Variants::Single { index: VariantIdx::new(0) },
-            fields: FieldsShape::Union(0),
+            fields: FieldsShape::Primitive,
             abi: Abi::Scalar(scalar),
             largest_niche,
             size,
@@ -995,7 +1024,7 @@ impl<T, E> MaybeResult<T> for Result<T, E> {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum PointerKind {
     /// Most general case, we know no restrictions to tell LLVM.
     Shared,
@@ -1010,11 +1039,12 @@ pub enum PointerKind {
     UniqueOwned,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct PointeeInfo {
     pub size: Size,
     pub align: Align,
     pub safe: Option<PointerKind>,
+    pub address_space: AddressSpace,
 }
 
 pub trait TyAndLayoutMethods<'a, C: LayoutOf<Ty = Self>>: Sized {

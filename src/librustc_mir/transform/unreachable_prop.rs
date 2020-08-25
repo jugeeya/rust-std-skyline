@@ -12,7 +12,7 @@ use std::borrow::Cow;
 pub struct UnreachablePropagation;
 
 impl MirPass<'_> for UnreachablePropagation {
-    fn run_pass<'tcx>(&self, tcx: TyCtxt<'tcx>, _: MirSource<'tcx>, body: &mut BodyAndCache<'tcx>) {
+    fn run_pass<'tcx>(&self, tcx: TyCtxt<'tcx>, _: MirSource<'tcx>, body: &mut Body<'tcx>) {
         if tcx.sess.opts.debugging_opts.mir_opt_level < 3 {
             // Enable only under -Zmir-opt-level=3 as in some cases (check the deeply-nested-opt
             // perf benchmark) LLVM may spend quite a lot of time optimizing the generated code.
@@ -67,18 +67,13 @@ fn remove_successors<F>(
 where
     F: Fn(BasicBlock) -> bool,
 {
-    match *terminator_kind {
-        TerminatorKind::Goto { target } if predicate(target) => Some(TerminatorKind::Unreachable),
+    let terminator = match *terminator_kind {
+        TerminatorKind::Goto { target } if predicate(target) => TerminatorKind::Unreachable,
         TerminatorKind::SwitchInt { ref discr, switch_ty, ref values, ref targets } => {
             let original_targets_len = targets.len();
             let (otherwise, targets) = targets.split_last().unwrap();
-            let retained = values
-                .iter()
-                .zip(targets.iter())
-                .filter(|(_, &t)| !predicate(t))
-                .collect::<Vec<_>>();
-            let mut values = retained.iter().map(|&(v, _)| *v).collect::<Vec<_>>();
-            let mut targets = retained.iter().map(|&(_, d)| *d).collect::<Vec<_>>();
+            let (mut values, mut targets): (Vec<_>, Vec<_>) =
+                values.iter().zip(targets.iter()).filter(|(_, &t)| !predicate(t)).unzip();
 
             if !predicate(*otherwise) {
                 targets.push(*otherwise);
@@ -89,20 +84,21 @@ where
             let retained_targets_len = targets.len();
 
             if targets.is_empty() {
-                Some(TerminatorKind::Unreachable)
+                TerminatorKind::Unreachable
             } else if targets.len() == 1 {
-                Some(TerminatorKind::Goto { target: targets[0] })
+                TerminatorKind::Goto { target: targets[0] }
             } else if original_targets_len != retained_targets_len {
-                Some(TerminatorKind::SwitchInt {
+                TerminatorKind::SwitchInt {
                     discr: discr.clone(),
                     switch_ty,
                     values: Cow::from(values),
                     targets,
-                })
+                }
             } else {
-                None
+                return None;
             }
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some(terminator)
 }

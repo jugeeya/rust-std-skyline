@@ -117,14 +117,6 @@ pub fn check(build: &mut Build) {
                 build.config.ninja = true;
             }
         }
-
-        if build.config.lldb_enabled {
-            cmd_finder.must_have("swig");
-            let out = output(Command::new("swig").arg("-version"));
-            if !out.contains("SWIG Version 3") && !out.contains("SWIG Version 4") {
-                panic!("Ensure that Swig 3.x.x or 4.x.x is installed.");
-            }
-        }
     }
 
     build.config.python = build
@@ -191,7 +183,11 @@ pub fn check(build: &mut Build) {
             panic!("the iOS target is only supported on macOS");
         }
 
-        build.config.target_config.entry(target.clone()).or_insert(Target::from_triple(target));
+        build
+            .config
+            .target_config
+            .entry(target.clone())
+            .or_insert(Target::from_triple(&target.triple));
 
         if target.contains("-none-") || target.contains("nvptx") {
             if build.no_std(*target) == Some(false) {
@@ -207,10 +203,10 @@ pub fn check(build: &mut Build) {
                 let target = build.config.target_config.entry(target.clone()).or_default();
                 target.musl_root = Some("/usr".into());
             }
-            match build.musl_root(*target) {
-                Some(root) => {
-                    if fs::metadata(root.join("lib/libc.a")).is_err() {
-                        panic!("couldn't find libc.a in musl dir: {}", root.join("lib").display());
+            match build.musl_libdir(*target) {
+                Some(libdir) => {
+                    if fs::metadata(libdir.join("libc.a")).is_err() {
+                        panic!("couldn't find libc.a in musl libdir: {}", libdir.display());
                     }
                 }
                 None => panic!(

@@ -1,12 +1,12 @@
-use rustc_ast::token::{self, Token, TokenKind};
-use rustc_ast::util::comments::is_doc_comment;
-use rustc_ast::with_default_globals;
+use rustc_ast::ast::AttrStyle;
+use rustc_ast::token::{self, CommentKind, Token, TokenKind};
 use rustc_data_structures::sync::Lrc;
 use rustc_errors::{emitter::EmitterWriter, Handler};
 use rustc_parse::lexer::StringReader;
 use rustc_session::parse::ParseSess;
 use rustc_span::source_map::{FilePathMapping, SourceMap};
 use rustc_span::symbol::Symbol;
+use rustc_span::with_default_session_globals;
 use rustc_span::{BytePos, Span};
 
 use std::io;
@@ -33,7 +33,7 @@ fn setup<'a>(sm: &SourceMap, sess: &'a ParseSess, teststr: String) -> StringRead
 
 #[test]
 fn t1() {
-    with_default_globals(|| {
+    with_default_session_globals(|| {
         let sm = Lrc::new(SourceMap::new(FilePathMapping::empty()));
         let sh = mk_sess(sm.clone());
         let mut string_reader = setup(
@@ -50,13 +50,13 @@ fn t1() {
         assert_eq!(string_reader.next_token(), token::Whitespace);
         // Read another token.
         let tok3 = string_reader.next_token();
-        assert_eq!(string_reader.pos.clone(), BytePos(28));
+        assert_eq!(string_reader.pos(), BytePos(28));
         let tok4 = Token::new(mk_ident("main"), Span::with_root_ctxt(BytePos(24), BytePos(28)));
         assert_eq!(tok3.kind, tok4.kind);
         assert_eq!(tok3.span, tok4.span);
 
         assert_eq!(string_reader.next_token(), token::OpenDelim(token::Paren));
-        assert_eq!(string_reader.pos.clone(), BytePos(29))
+        assert_eq!(string_reader.pos(), BytePos(29))
     })
 }
 
@@ -79,7 +79,7 @@ fn mk_lit(kind: token::LitKind, symbol: &str, suffix: Option<&str>) -> TokenKind
 
 #[test]
 fn doublecolon_parsing() {
-    with_default_globals(|| {
+    with_default_session_globals(|| {
         let sm = Lrc::new(SourceMap::new(FilePathMapping::empty()));
         let sh = mk_sess(sm.clone());
         check_tokenization(
@@ -91,7 +91,7 @@ fn doublecolon_parsing() {
 
 #[test]
 fn doublecolon_parsing_2() {
-    with_default_globals(|| {
+    with_default_session_globals(|| {
         let sm = Lrc::new(SourceMap::new(FilePathMapping::empty()));
         let sh = mk_sess(sm.clone());
         check_tokenization(
@@ -103,7 +103,7 @@ fn doublecolon_parsing_2() {
 
 #[test]
 fn doublecolon_parsing_3() {
-    with_default_globals(|| {
+    with_default_session_globals(|| {
         let sm = Lrc::new(SourceMap::new(FilePathMapping::empty()));
         let sh = mk_sess(sm.clone());
         check_tokenization(
@@ -115,7 +115,7 @@ fn doublecolon_parsing_3() {
 
 #[test]
 fn doublecolon_parsing_4() {
-    with_default_globals(|| {
+    with_default_session_globals(|| {
         let sm = Lrc::new(SourceMap::new(FilePathMapping::empty()));
         let sh = mk_sess(sm.clone());
         check_tokenization(
@@ -127,7 +127,7 @@ fn doublecolon_parsing_4() {
 
 #[test]
 fn character_a() {
-    with_default_globals(|| {
+    with_default_session_globals(|| {
         let sm = Lrc::new(SourceMap::new(FilePathMapping::empty()));
         let sh = mk_sess(sm.clone());
         assert_eq!(setup(&sm, &sh, "'a'".to_string()).next_token(), mk_lit(token::Char, "a", None),);
@@ -136,7 +136,7 @@ fn character_a() {
 
 #[test]
 fn character_space() {
-    with_default_globals(|| {
+    with_default_session_globals(|| {
         let sm = Lrc::new(SourceMap::new(FilePathMapping::empty()));
         let sh = mk_sess(sm.clone());
         assert_eq!(setup(&sm, &sh, "' '".to_string()).next_token(), mk_lit(token::Char, " ", None),);
@@ -145,7 +145,7 @@ fn character_space() {
 
 #[test]
 fn character_escaped() {
-    with_default_globals(|| {
+    with_default_session_globals(|| {
         let sm = Lrc::new(SourceMap::new(FilePathMapping::empty()));
         let sh = mk_sess(sm.clone());
         assert_eq!(
@@ -157,7 +157,7 @@ fn character_escaped() {
 
 #[test]
 fn lifetime_name() {
-    with_default_globals(|| {
+    with_default_session_globals(|| {
         let sm = Lrc::new(SourceMap::new(FilePathMapping::empty()));
         let sh = mk_sess(sm.clone());
         assert_eq!(
@@ -169,7 +169,7 @@ fn lifetime_name() {
 
 #[test]
 fn raw_string() {
-    with_default_globals(|| {
+    with_default_session_globals(|| {
         let sm = Lrc::new(SourceMap::new(FilePathMapping::empty()));
         let sh = mk_sess(sm.clone());
         assert_eq!(
@@ -181,7 +181,7 @@ fn raw_string() {
 
 #[test]
 fn literal_suffixes() {
-    with_default_globals(|| {
+    with_default_session_globals(|| {
         let sm = Lrc::new(SourceMap::new(FilePathMapping::empty()));
         let sh = mk_sess(sm.clone());
         macro_rules! test {
@@ -224,15 +224,8 @@ fn literal_suffixes() {
 }
 
 #[test]
-fn line_doc_comments() {
-    assert!(is_doc_comment("///"));
-    assert!(is_doc_comment("/// blah"));
-    assert!(!is_doc_comment("////"));
-}
-
-#[test]
 fn nested_block_comments() {
-    with_default_globals(|| {
+    with_default_session_globals(|| {
         let sm = Lrc::new(SourceMap::new(FilePathMapping::empty()));
         let sh = mk_sess(sm.clone());
         let mut lexer = setup(&sm, &sh, "/* /* */ */'a'".to_string());
@@ -243,7 +236,7 @@ fn nested_block_comments() {
 
 #[test]
 fn crlf_comments() {
-    with_default_globals(|| {
+    with_default_session_globals(|| {
         let sm = Lrc::new(SourceMap::new(FilePathMapping::empty()));
         let sh = mk_sess(sm.clone());
         let mut lexer = setup(&sm, &sh, "// test\r\n/// test\r\n".to_string());
@@ -251,6 +244,9 @@ fn crlf_comments() {
         assert_eq!(comment.kind, token::Comment);
         assert_eq!((comment.span.lo(), comment.span.hi()), (BytePos(0), BytePos(7)));
         assert_eq!(lexer.next_token(), token::Whitespace);
-        assert_eq!(lexer.next_token(), token::DocComment(Symbol::intern("/// test")));
+        assert_eq!(
+            lexer.next_token(),
+            token::DocComment(CommentKind::Line, AttrStyle::Outer, Symbol::intern(" test"))
+        );
     })
 }

@@ -8,13 +8,11 @@ use rustc_middle::hir::map::Map;
 use rustc_middle::ty::query::Providers;
 use rustc_middle::ty::TyCtxt;
 
-use rustc_ast::ast::{Attribute, NestedMetaItem};
-use rustc_ast::attr;
+use rustc_ast::{Attribute, NestedMetaItem};
 use rustc_errors::struct_span_err;
 use rustc_hir as hir;
-use rustc_hir::def_id::DefId;
+use rustc_hir::def_id::LocalDefId;
 use rustc_hir::intravisit::{self, NestedVisitorMap, Visitor};
-use rustc_hir::DUMMY_HIR_ID;
 use rustc_hir::{self, HirId, Item, ItemKind, TraitItem};
 use rustc_hir::{MethodKind, Target};
 use rustc_session::lint::builtin::{CONFLICTING_REPR_HINTS, UNUSED_ATTRIBUTES};
@@ -22,7 +20,10 @@ use rustc_session::parse::feature_err;
 use rustc_span::symbol::sym;
 use rustc_span::Span;
 
-fn target_from_impl_item<'tcx>(tcx: TyCtxt<'tcx>, impl_item: &hir::ImplItem<'_>) -> Target {
+pub(crate) fn target_from_impl_item<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    impl_item: &hir::ImplItem<'_>,
+) -> Target {
     match impl_item.kind {
         hir::ImplItemKind::Const(..) => Target::AssocConst,
         hir::ImplItemKind::Fn(..) => {
@@ -38,7 +39,7 @@ fn target_from_impl_item<'tcx>(tcx: TyCtxt<'tcx>, impl_item: &hir::ImplItem<'_>)
                 Target::Method(MethodKind::Inherent)
             }
         }
-        hir::ImplItemKind::TyAlias(..) | hir::ImplItemKind::OpaqueTy(..) => Target::AssocTy,
+        hir::ImplItemKind::TyAlias(..) => Target::AssocTy,
     }
 }
 
@@ -58,16 +59,18 @@ impl CheckAttrVisitor<'tcx> {
     ) {
         let mut is_valid = true;
         for attr in attrs {
-            is_valid &= if attr.check_name(sym::inline) {
+            is_valid &= if self.tcx.sess.check_name(attr, sym::inline) {
                 self.check_inline(hir_id, attr, span, target)
-            } else if attr.check_name(sym::non_exhaustive) {
+            } else if self.tcx.sess.check_name(attr, sym::non_exhaustive) {
                 self.check_non_exhaustive(attr, span, target)
-            } else if attr.check_name(sym::marker) {
+            } else if self.tcx.sess.check_name(attr, sym::marker) {
                 self.check_marker(attr, span, target)
-            } else if attr.check_name(sym::target_feature) {
+            } else if self.tcx.sess.check_name(attr, sym::target_feature) {
                 self.check_target_feature(attr, span, target)
-            } else if attr.check_name(sym::track_caller) {
+            } else if self.tcx.sess.check_name(attr, sym::track_caller) {
                 self.check_track_caller(&attr.span, attrs, span, target)
+            } else if self.tcx.sess.check_name(attr, sym::doc) {
+                self.check_doc_alias(attr, hir_id, target)
             } else {
                 true
             };
@@ -77,8 +80,8 @@ impl CheckAttrVisitor<'tcx> {
             return;
         }
 
-        if target == Target::Fn {
-            self.tcx.codegen_fn_attrs(self.tcx.hir().local_def_id(hir_id));
+        if matches!(target, Target::Fn | Target::Method(_) | Target::ForeignFn) {
+            self.tcx.ensure().codegen_fn_attrs(self.tcx.hir().local_def_id(hir_id));
         }
 
         self.check_repr(attrs, span, target, item, hir_id);
@@ -90,8 +93,7 @@ impl CheckAttrVisitor<'tcx> {
         match target {
             Target::Fn
             | Target::Closure
-            | Target::Method(MethodKind::Trait { body: true })
-            | Target::Method(MethodKind::Inherent) => true,
+            | Target::Method(MethodKind::Trait { body: true } | MethodKind::Inherent) => true,
             Target::Method(MethodKind::Trait { body: false }) | Target::ForeignFn => {
                 self.tcx.struct_span_lint_hir(UNUSED_ATTRIBUTES, hir_id, attr.span, |lint| {
                     lint.build("`#[inline]` is ignored on function prototypes").emit()
@@ -141,7 +143,7 @@ impl CheckAttrVisitor<'tcx> {
         target: Target,
     ) -> bool {
         match target {
-            _ if attr::contains_name(attrs, sym::naked) => {
+            _ if self.tcx.sess.contains_name(attrs, sym::naked) => {
                 struct_span_err!(
                     self.tcx.sess,
                     *attr_span,
@@ -203,8 +205,7 @@ impl CheckAttrVisitor<'tcx> {
     fn check_target_feature(&self, attr: &Attribute, span: &Span, target: Target) -> bool {
         match target {
             Target::Fn
-            | Target::Method(MethodKind::Trait { body: true })
-            | Target::Method(MethodKind::Inherent) => true,
+            | Target::Method(MethodKind::Trait { body: true } | MethodKind::Inherent) => true,
             _ => {
                 self.tcx
                     .sess
@@ -214,6 +215,56 @@ impl CheckAttrVisitor<'tcx> {
                 false
             }
         }
+    }
+
+    fn check_doc_alias(&self, attr: &Attribute, hir_id: HirId, target: Target) -> bool {
+        if let Some(mi) = attr.meta() {
+            if let Some(list) = mi.meta_item_list() {
+                for meta in list {
+                    if meta.has_name(sym::alias) {
+                        if !meta.is_value_str()
+                            || meta
+                                .value_str()
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(String::new)
+                                .is_empty()
+                        {
+                            self.tcx
+                                .sess
+                                .struct_span_err(
+                                    meta.span(),
+                                    "doc alias attribute expects a string: #[doc(alias = \"0\")]",
+                                )
+                                .emit();
+                            return false;
+                        }
+                        if let Some(err) = match target {
+                            Target::Impl => Some("implementation block"),
+                            Target::ForeignMod => Some("extern block"),
+                            Target::AssocTy => {
+                                let parent_hir_id = self.tcx.hir().get_parent_item(hir_id);
+                                let containing_item = self.tcx.hir().expect_item(parent_hir_id);
+                                if Target::from_item(containing_item) == Target::Impl {
+                                    Some("type alias in implementation block")
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        } {
+                            self.tcx
+                                .sess
+                                .struct_span_err(
+                                    meta.span(),
+                                    &format!("`#[doc(alias = \"...\")]` isn't allowed on {}", err,),
+                                )
+                                .emit();
+                        }
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Checks if the `#[repr]` attributes on `item` are valid.
@@ -232,7 +283,7 @@ impl CheckAttrVisitor<'tcx> {
         // ```
         let hints: Vec<_> = attrs
             .iter()
-            .filter(|attr| attr.check_name(sym::repr))
+            .filter(|attr| self.tcx.sess.check_name(attr, sym::repr))
             .filter_map(|attr| attr.meta_item_list())
             .flatten()
             .collect();
@@ -292,6 +343,8 @@ impl CheckAttrVisitor<'tcx> {
                 | sym::u32
                 | sym::i64
                 | sym::u64
+                | sym::i128
+                | sym::u128
                 | sym::isize
                 | sym::usize => {
                     int_reprs += 1;
@@ -359,10 +412,10 @@ impl CheckAttrVisitor<'tcx> {
         // When checking statements ignore expressions, they will be checked later
         if let hir::StmtKind::Local(ref l) = stmt.kind {
             for attr in l.attrs.iter() {
-                if attr.check_name(sym::inline) {
-                    self.check_inline(DUMMY_HIR_ID, attr, &stmt.span, Target::Statement);
+                if self.tcx.sess.check_name(attr, sym::inline) {
+                    self.check_inline(l.hir_id, attr, &stmt.span, Target::Statement);
                 }
-                if attr.check_name(sym::repr) {
+                if self.tcx.sess.check_name(attr, sym::repr) {
                     self.emit_repr_error(
                         attr.span,
                         stmt.span,
@@ -380,10 +433,10 @@ impl CheckAttrVisitor<'tcx> {
             _ => Target::Expression,
         };
         for attr in expr.attrs.iter() {
-            if attr.check_name(sym::inline) {
-                self.check_inline(DUMMY_HIR_ID, attr, &expr.span, target);
+            if self.tcx.sess.check_name(attr, sym::inline) {
+                self.check_inline(expr.hir_id, attr, &expr.span, target);
             }
-            if attr.check_name(sym::repr) {
+            if self.tcx.sess.check_name(attr, sym::repr) {
                 self.emit_repr_error(
                     attr.span,
                     expr.span,
@@ -392,11 +445,14 @@ impl CheckAttrVisitor<'tcx> {
                 );
             }
         }
+        if target == Target::Closure {
+            self.tcx.ensure().codegen_fn_attrs(self.tcx.hir().local_def_id(expr.hir_id));
+        }
     }
 
     fn check_used(&self, attrs: &'hir [Attribute], target: Target) {
         for attr in attrs {
-            if attr.check_name(sym::used) && target != Target::Static {
+            if self.tcx.sess.check_name(attr, sym::used) && target != Target::Static {
                 self.tcx
                     .sess
                     .span_err(attr.span, "attribute must be applied to a `static` variable");
@@ -461,11 +517,11 @@ fn is_c_like_enum(item: &Item<'_>) -> bool {
     }
 }
 
-fn check_mod_attrs(tcx: TyCtxt<'_>, module_def_id: DefId) {
+fn check_mod_attrs(tcx: TyCtxt<'_>, module_def_id: LocalDefId) {
     tcx.hir()
         .visit_item_likes_in_module(module_def_id, &mut CheckAttrVisitor { tcx }.as_deep_visitor());
 }
 
-pub(crate) fn provide(providers: &mut Providers<'_>) {
+pub(crate) fn provide(providers: &mut Providers) {
     *providers = Providers { check_mod_attrs, ..*providers };
 }

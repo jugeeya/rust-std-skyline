@@ -1,8 +1,9 @@
 use crate::mir::mono::Linkage;
 use rustc_attr::{InlineAttr, OptimizeAttr};
+use rustc_session::config::SanitizerSet;
 use rustc_span::symbol::Symbol;
 
-#[derive(Clone, RustcEncodable, RustcDecodable, HashStable)]
+#[derive(Clone, TyEncodable, TyDecodable, HashStable)]
 pub struct CodegenFnAttrs {
     pub flags: CodegenFnAttrFlags,
     /// Parsed representation of the `#[inline]` attribute
@@ -30,10 +31,13 @@ pub struct CodegenFnAttrs {
     /// The `#[link_section = "..."]` attribute, or what executable section this
     /// should be placed in.
     pub link_section: Option<Symbol>,
+    /// The `#[no_sanitize(...)]` attribute. Indicates sanitizers for which
+    /// instrumentation should be disabled inside the annotated function.
+    pub no_sanitize: SanitizerSet,
 }
 
 bitflags! {
-    #[derive(RustcEncodable, RustcDecodable, HashStable)]
+    #[derive(TyEncodable, TyDecodable, HashStable)]
     pub struct CodegenFnAttrFlags: u32 {
         /// `#[cold]`: a hint to LLVM that this function, when called, is never on
         /// the hot path.
@@ -69,14 +73,12 @@ bitflags! {
         const FFI_RETURNS_TWICE         = 1 << 10;
         /// `#[track_caller]`: allow access to the caller location
         const TRACK_CALLER              = 1 << 11;
-        /// `#[no_sanitize(address)]`: disables address sanitizer instrumentation
-        const NO_SANITIZE_ADDRESS = 1 << 12;
-        /// `#[no_sanitize(memory)]`: disables memory sanitizer instrumentation
-        const NO_SANITIZE_MEMORY  = 1 << 13;
-        /// `#[no_sanitize(thread)]`: disables thread sanitizer instrumentation
-        const NO_SANITIZE_THREAD  = 1 << 14;
-        /// All `#[no_sanitize(...)]` attributes.
-        const NO_SANITIZE_ANY = Self::NO_SANITIZE_ADDRESS.bits | Self::NO_SANITIZE_MEMORY.bits | Self::NO_SANITIZE_THREAD.bits;
+        /// #[ffi_pure]: applies clang's `pure` attribute to a foreign function
+        /// declaration.
+        const FFI_PURE                  = 1 << 12;
+        /// #[ffi_const]: applies clang's `const` attribute to a foreign function
+        /// declaration.
+        const FFI_CONST                 = 1 << 13;
     }
 }
 
@@ -92,6 +94,7 @@ impl CodegenFnAttrs {
             target_features: vec![],
             linkage: None,
             link_section: None,
+            no_sanitize: SanitizerSet::empty(),
         }
     }
 
@@ -114,7 +117,7 @@ impl CodegenFnAttrs {
             || match self.linkage {
                 // These are private, so make sure we don't try to consider
                 // them external.
-                None | Some(Linkage::Internal) | Some(Linkage::Private) => false,
+                None | Some(Linkage::Internal | Linkage::Private) => false,
                 Some(_) => true,
             }
     }

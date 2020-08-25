@@ -18,7 +18,6 @@ use crate::{
     pluralize, CodeSuggestion, Diagnostic, DiagnosticId, Level, SubDiagnostic, SuggestionStyle,
 };
 
-use log::*;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::sync::Lrc;
 use rustc_span::hygiene::{ExpnKind, MacroKind};
@@ -30,6 +29,10 @@ use std::iter;
 use std::path::Path;
 use termcolor::{Ansi, BufferWriter, ColorChoice, ColorSpec, StandardStream};
 use termcolor::{Buffer, Color, WriteColor};
+use tracing::*;
+
+/// Default column width, used in tests and when terminal dimensions cannot be determined.
+const DEFAULT_COLUMN_WIDTH: usize = 140;
 
 /// Describes the way the content of the `rendered` field of the json output is generated
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,7 +77,8 @@ struct Margin {
     pub computed_left: usize,
     /// The end of the line to be displayed.
     pub computed_right: usize,
-    /// The current width of the terminal. 140 by default and in tests.
+    /// The current width of the terminal. Uses value of `DEFAULT_COLUMN_WIDTH` constant by default
+    /// and in tests.
     pub column_width: usize,
     /// The end column of a span label, including the span. Doesn't account for labels not in the
     /// same line as the span.
@@ -285,21 +289,18 @@ pub trait Emitter {
         let has_macro_spans = iter::once(&*span)
             .chain(children.iter().map(|child| &child.span))
             .flat_map(|span| span.primary_spans())
-            .copied()
-            .flat_map(|sp| {
-                sp.macro_backtrace().filter_map(|expn_data| {
-                    match expn_data.kind {
-                        ExpnKind::Root => None,
+            .flat_map(|sp| sp.macro_backtrace())
+            .find_map(|expn_data| {
+                match expn_data.kind {
+                    ExpnKind::Root => None,
 
-                        // Skip past non-macro entries, just in case there
-                        // are some which do actually involve macros.
-                        ExpnKind::Desugaring(..) | ExpnKind::AstPass(..) => None,
+                    // Skip past non-macro entries, just in case there
+                    // are some which do actually involve macros.
+                    ExpnKind::Desugaring(..) | ExpnKind::AstPass(..) => None,
 
-                        ExpnKind::Macro(macro_kind, _) => Some(macro_kind),
-                    }
-                })
-            })
-            .next();
+                    ExpnKind::Macro(macro_kind, _) => Some(macro_kind),
+                }
+            });
 
         if !backtrace {
             self.fix_multispans_in_extern_macros(source_map, span, children);
@@ -361,7 +362,7 @@ pub trait Emitter {
                         format!(
                             "in this expansion of `{}`{}",
                             trace.kind.descr(),
-                            if macro_backtrace.len() > 2 {
+                            if macro_backtrace.len() > 1 {
                                 // if macro_backtrace.len() == 1 it'll be
                                 // pointed at by "in this macro invocation"
                                 format!(" (#{})", i + 1)
@@ -392,7 +393,7 @@ pub trait Emitter {
                         trace.call_site,
                         format!(
                             "in this macro invocation{}",
-                            if macro_backtrace.len() > 2 && always_backtrace {
+                            if macro_backtrace.len() > 1 && always_backtrace {
                                 // only specify order when the macro
                                 // backtrace is multiple levels deep
                                 format!(" (#{})", i + 1)
@@ -1417,11 +1418,11 @@ impl EmitterWriter {
                 let column_width = if let Some(width) = self.terminal_width {
                     width.saturating_sub(code_offset)
                 } else if self.ui_testing {
-                    140
+                    DEFAULT_COLUMN_WIDTH
                 } else {
                     termize::dimensions()
                         .map(|(w, _)| w.saturating_sub(code_offset))
-                        .unwrap_or(usize::MAX)
+                        .unwrap_or(DEFAULT_COLUMN_WIDTH)
                 };
 
                 let margin = Margin::new(
@@ -2005,7 +2006,7 @@ fn emit_to_destination(
     let _buffer_lock = lock::acquire_global_lock("rustc_errors");
     for (pos, line) in rendered_buffer.iter().enumerate() {
         for part in line {
-            dst.apply_style(lvl.clone(), part.style)?;
+            dst.apply_style(*lvl, part.style)?;
             write!(dst, "{}", part.text)?;
             dst.reset()?;
         }

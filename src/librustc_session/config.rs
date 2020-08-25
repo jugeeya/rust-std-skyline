@@ -5,11 +5,12 @@ pub use crate::options::*;
 
 use crate::lint;
 use crate::search_paths::SearchPath;
-use crate::utils::NativeLibraryKind;
+use crate::utils::NativeLibKind;
 use crate::{early_error, early_warn, Session};
 
 use rustc_data_structures::fx::FxHashSet;
 use rustc_data_structures::impl_stable_hash_via_hash;
+use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 
 use rustc_target::spec::{Target, TargetTriple};
 
@@ -37,39 +38,72 @@ pub struct Config {
     pub ptr_width: u32,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Sanitizer {
-    Address,
-    Leak,
-    Memory,
-    Thread,
+bitflags! {
+    #[derive(Default, Encodable, Decodable)]
+    pub struct SanitizerSet: u8 {
+        const ADDRESS = 1 << 0;
+        const LEAK    = 1 << 1;
+        const MEMORY  = 1 << 2;
+        const THREAD  = 1 << 3;
+    }
 }
 
-impl fmt::Display for Sanitizer {
+/// Formats a sanitizer set as a comma separated list of sanitizers' names.
+impl fmt::Display for SanitizerSet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            Sanitizer::Address => "address".fmt(f),
-            Sanitizer::Leak => "leak".fmt(f),
-            Sanitizer::Memory => "memory".fmt(f),
-            Sanitizer::Thread => "thread".fmt(f),
+        let mut first = true;
+        for s in *self {
+            let name = match s {
+                SanitizerSet::ADDRESS => "address",
+                SanitizerSet::LEAK => "leak",
+                SanitizerSet::MEMORY => "memory",
+                SanitizerSet::THREAD => "thread",
+                _ => panic!("unrecognized sanitizer {:?}", s),
+            };
+            if !first {
+                f.write_str(",")?;
+            }
+            f.write_str(name)?;
+            first = false;
         }
+        Ok(())
     }
 }
 
-impl FromStr for Sanitizer {
-    type Err = ();
-    fn from_str(s: &str) -> Result<Sanitizer, ()> {
-        match s {
-            "address" => Ok(Sanitizer::Address),
-            "leak" => Ok(Sanitizer::Leak),
-            "memory" => Ok(Sanitizer::Memory),
-            "thread" => Ok(Sanitizer::Thread),
-            _ => Err(()),
-        }
+impl IntoIterator for SanitizerSet {
+    type Item = SanitizerSet;
+    type IntoIter = std::vec::IntoIter<SanitizerSet>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        [SanitizerSet::ADDRESS, SanitizerSet::LEAK, SanitizerSet::MEMORY, SanitizerSet::THREAD]
+            .iter()
+            .copied()
+            .filter(|&s| self.contains(s))
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 }
 
-/// The different settings that the `-Z control_flow_guard` flag can have.
+impl<CTX> HashStable<CTX> for SanitizerSet {
+    fn hash_stable(&self, ctx: &mut CTX, hasher: &mut StableHasher) {
+        self.bits().hash_stable(ctx, hasher);
+    }
+}
+
+/// The different settings that the `-Z strip` flag can have.
+#[derive(Clone, Copy, PartialEq, Hash, Debug)]
+pub enum Strip {
+    /// Do not strip at all.
+    None,
+
+    /// Strip debuginfo.
+    Debuginfo,
+
+    /// Strip all symbols.
+    Symbols,
+}
+
+/// The different settings that the `-C control-flow-guard` flag can have.
 #[derive(Clone, Copy, PartialEq, Hash, Debug)]
 pub enum CFGuard {
     /// Do not emit Control Flow Guard metadata or checks.
@@ -160,7 +194,8 @@ impl SwitchWithOptPath {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, RustcEncodable, RustcDecodable)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Encodable, Decodable)]
 pub enum SymbolManglingVersion {
     Legacy,
     V0,
@@ -175,7 +210,8 @@ pub enum DebugInfo {
     Full,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord, RustcEncodable, RustcDecodable)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+#[derive(Encodable, Decodable)]
 pub enum OutputType {
     Bitcode,
     Assembly,
@@ -617,10 +653,6 @@ impl Options {
 }
 
 impl DebuggingOptions {
-    pub fn ui_testing(&self) -> bool {
-        self.ui_testing.unwrap_or(false)
-    }
-
     pub fn diagnostic_handler_flags(&self, can_emit_warnings: bool) -> HandlerFlags {
         HandlerFlags {
             can_emit_warnings,
@@ -628,7 +660,7 @@ impl DebuggingOptions {
             dont_buffer_diagnostics: self.dont_buffer_diagnostics,
             report_delayed_bugs: self.report_delayed_bugs,
             macro_backtrace: self.macro_backtrace,
-            deduplicate_diagnostics: self.deduplicate_diagnostics.unwrap_or(true),
+            deduplicate_diagnostics: self.deduplicate_diagnostics,
         }
     }
 }
@@ -642,7 +674,7 @@ pub enum EntryFnType {
 
 impl_stable_hash_via_hash!(EntryFnType);
 
-#[derive(Copy, PartialEq, PartialOrd, Clone, Ord, Eq, Hash, Debug, RustcEncodable, RustcDecodable)]
+#[derive(Copy, PartialEq, PartialOrd, Clone, Ord, Eq, Hash, Debug, Encodable, Decodable)]
 pub enum CrateType {
     Executable,
     Dylib,
@@ -687,18 +719,20 @@ pub fn default_configuration(sess: &Session) -> CrateConfig {
     let mut ret = FxHashSet::default();
     ret.reserve(6); // the minimum number of insertions
     // Target bindings.
-    ret.insert((Symbol::intern("target_os"), Some(Symbol::intern(os))));
+    ret.insert((sym::target_os, Some(Symbol::intern(os))));
     if let Some(ref fam) = sess.target.target.options.target_family {
-        ret.insert((Symbol::intern("target_family"), Some(Symbol::intern(fam))));
-        if fam == "windows" || fam == "unix" {
-            ret.insert((Symbol::intern(fam), None));
+        ret.insert((sym::target_family, Some(Symbol::intern(fam))));
+        if fam == "windows" {
+            ret.insert((sym::windows, None));
+        } else if fam == "unix" {
+            ret.insert((sym::unix, None));
         }
     }
-    ret.insert((Symbol::intern("target_arch"), Some(Symbol::intern(arch))));
-    ret.insert((Symbol::intern("target_endian"), Some(Symbol::intern(end))));
-    ret.insert((Symbol::intern("target_pointer_width"), Some(Symbol::intern(wordsz))));
-    ret.insert((Symbol::intern("target_env"), Some(Symbol::intern(env))));
-    ret.insert((Symbol::intern("target_vendor"), Some(Symbol::intern(vendor))));
+    ret.insert((sym::target_arch, Some(Symbol::intern(arch))));
+    ret.insert((sym::target_endian, Some(Symbol::intern(end))));
+    ret.insert((sym::target_pointer_width, Some(Symbol::intern(wordsz))));
+    ret.insert((sym::target_env, Some(Symbol::intern(env))));
+    ret.insert((sym::target_vendor, Some(Symbol::intern(vendor))));
     if sess.target.target.options.has_elf_tls {
         ret.insert((sym::target_thread_local, None));
     }
@@ -717,12 +751,14 @@ pub fn default_configuration(sess: &Session) -> CrateConfig {
             }
         }
     }
-    if let Some(s) = &sess.opts.debugging_opts.sanitizer {
+
+    for s in sess.opts.debugging_opts.sanitizer {
         let symbol = Symbol::intern(&s.to_string());
         ret.insert((sym::sanitize, Some(symbol)));
     }
+
     if sess.opts.debug_assertions {
-        ret.insert((Symbol::intern("debug_assertions"), None));
+        ret.insert((sym::debug_assertions, None));
     }
     if sess.opts.crate_types.contains(&CrateType::ProcMacro) {
         ret.insert((sym::proc_macro, None));
@@ -1022,7 +1058,7 @@ pub fn get_cmd_lint_options(
                 // HACK: forbid is always specified last, so it can't be overridden.
                 // FIXME: remove this once <https://github.com/rust-lang/rust/issues/70819> is
                 // fixed and `forbid` works as expected.
-                usize::max_value()
+                usize::MAX
             } else {
                 passed_arg_pos
             };
@@ -1315,18 +1351,6 @@ fn collect_print_requests(
         prints.push(PrintRequest::TargetFeatures);
         cg.target_feature = String::new();
     }
-    if cg.relocation_model.as_ref().map_or(false, |s| s == "help") {
-        prints.push(PrintRequest::RelocationModels);
-        cg.relocation_model = None;
-    }
-    if cg.code_model.as_ref().map_or(false, |s| s == "help") {
-        prints.push(PrintRequest::CodeModels);
-        cg.code_model = None;
-    }
-    if dopts.tls_model.as_ref().map_or(false, |s| s == "help") {
-        prints.push(PrintRequest::TlsModels);
-        dopts.tls_model = None;
-    }
 
     prints.extend(matches.opt_strs("print").into_iter().map(|s| match &*s {
         "crate-name" => PrintRequest::CrateName,
@@ -1395,15 +1419,14 @@ fn parse_opt_level(
     if max_o > max_c {
         OptLevel::Default
     } else {
-        match cg.opt_level.as_ref().map(String::as_ref) {
-            None => OptLevel::No,
-            Some("0") => OptLevel::No,
-            Some("1") => OptLevel::Less,
-            Some("2") => OptLevel::Default,
-            Some("3") => OptLevel::Aggressive,
-            Some("s") => OptLevel::Size,
-            Some("z") => OptLevel::SizeMin,
-            Some(arg) => {
+        match cg.opt_level.as_ref() {
+            "0" => OptLevel::No,
+            "1" => OptLevel::Less,
+            "2" => OptLevel::Default,
+            "3" => OptLevel::Aggressive,
+            "s" => OptLevel::Size,
+            "z" => OptLevel::SizeMin,
+            arg => {
                 early_error(
                     error_format,
                     &format!(
@@ -1436,10 +1459,10 @@ fn select_debuginfo(
         DebugInfo::Full
     } else {
         match cg.debuginfo {
-            None | Some(0) => DebugInfo::None,
-            Some(1) => DebugInfo::Limited,
-            Some(2) => DebugInfo::Full,
-            Some(arg) => {
+            0 => DebugInfo::None,
+            1 => DebugInfo::Limited,
+            2 => DebugInfo::Full,
+            arg => {
                 early_error(
                     error_format,
                     &format!(
@@ -1456,7 +1479,7 @@ fn select_debuginfo(
 fn parse_libs(
     matches: &getopts::Matches,
     error_format: ErrorOutputType,
-) -> Vec<(String, Option<String>, Option<NativeLibraryKind>)> {
+) -> Vec<(String, Option<String>, NativeLibKind)> {
     matches
         .opt_strs("l")
         .into_iter()
@@ -1466,13 +1489,11 @@ fn parse_libs(
             let mut parts = s.splitn(2, '=');
             let kind = parts.next().unwrap();
             let (name, kind) = match (parts.next(), kind) {
-                (None, name) => (name, None),
-                (Some(name), "dylib") => (name, Some(NativeLibraryKind::NativeUnknown)),
-                (Some(name), "framework") => (name, Some(NativeLibraryKind::NativeFramework)),
-                (Some(name), "static") => (name, Some(NativeLibraryKind::NativeStatic)),
-                (Some(name), "static-nobundle") => {
-                    (name, Some(NativeLibraryKind::NativeStaticNobundle))
-                }
+                (None, name) => (name, NativeLibKind::Unspecified),
+                (Some(name), "dylib") => (name, NativeLibKind::Dylib),
+                (Some(name), "framework") => (name, NativeLibKind::Framework),
+                (Some(name), "static") => (name, NativeLibKind::StaticBundle),
+                (Some(name), "static-nobundle") => (name, NativeLibKind::StaticNoBundle),
                 (_, s) => {
                     early_error(
                         error_format,
@@ -1484,9 +1505,7 @@ fn parse_libs(
                     );
                 }
             };
-            if kind == Some(NativeLibraryKind::NativeStaticNobundle)
-                && !nightly_options::is_nightly_build()
-            {
+            if kind == NativeLibKind::StaticNoBundle && !nightly_options::is_nightly_build() {
                 early_error(
                     error_format,
                     "the library kind 'static-nobundle' is only \
@@ -1502,10 +1521,10 @@ fn parse_libs(
 }
 
 fn parse_borrowck_mode(dopts: &DebuggingOptions, error_format: ErrorOutputType) -> BorrowckMode {
-    match dopts.borrowck.as_ref().map(|s| &s[..]) {
-        None | Some("migrate") => BorrowckMode::Migrate,
-        Some("mir") => BorrowckMode::Mir,
-        Some(m) => early_error(error_format, &format!("unknown borrowck mode `{}`", m)),
+    match dopts.borrowck.as_ref() {
+        "migrate" => BorrowckMode::Migrate,
+        "mir" => BorrowckMode::Mir,
+        m => early_error(error_format, &format!("unknown borrowck mode `{}`", m)),
     }
 }
 
@@ -1655,7 +1674,7 @@ pub fn build_session_options(matches: &getopts::Matches) -> Options {
     let output_types = parse_output_types(&debugging_opts, matches, error_format);
 
     let mut cg = build_codegen_options(matches, error_format);
-    let (disable_thinlto, codegen_units) = should_override_cgus_and_disable_thinlto(
+    let (disable_thinlto, mut codegen_units) = should_override_cgus_and_disable_thinlto(
         &output_types,
         matches,
         error_format,
@@ -1672,12 +1691,57 @@ pub fn build_session_options(matches: &getopts::Matches) -> Options {
             "can't instrument with gcov profiling when compiling incrementally",
         );
     }
+    if debugging_opts.profile {
+        match codegen_units {
+            Some(1) => {}
+            None => codegen_units = Some(1),
+            Some(_) => early_error(
+                error_format,
+                "can't instrument with gcov profiling with multiple codegen units",
+            ),
+        }
+    }
 
     if cg.profile_generate.enabled() && cg.profile_use.is_some() {
         early_error(
             error_format,
             "options `-C profile-generate` and `-C profile-use` are exclusive",
         );
+    }
+
+    if debugging_opts.instrument_coverage {
+        if cg.profile_generate.enabled() || cg.profile_use.is_some() {
+            early_error(
+                error_format,
+                "option `-Z instrument-coverage` is not compatible with either `-C profile-use` \
+                or `-C profile-generate`",
+            );
+        }
+
+        // `-Z instrument-coverage` implies:
+        //   * `-Z symbol-mangling-version=v0` - to ensure consistent and reversible name mangling.
+        //     Note, LLVM coverage tools can analyze coverage over multiple runs, including some
+        //     changes to source code; so mangled names must be consistent across compilations.
+        //   * `-C link-dead-code` - so unexecuted code is still counted as zero, rather than be
+        //     optimized out. Note that instrumenting dead code can be explicitly disabled with:
+        //         `-Z instrument-coverage -C link-dead-code=no`.
+        debugging_opts.symbol_mangling_version = SymbolManglingVersion::V0;
+        if cg.link_dead_code == None {
+            // FIXME(richkadel): Investigate if the `instrument-coverage` implementation can
+            // inject ["zero counters"](https://llvm.org/docs/CoverageMappingFormat.html#counter)
+            // in the coverage map when "dead code" is removed, rather than forcing `link-dead-code`.
+            cg.link_dead_code = Some(true);
+        }
+    }
+
+    if !cg.embed_bitcode {
+        match cg.lto {
+            LtoCli::No | LtoCli::Unspecified => {}
+            LtoCli::Yes | LtoCli::NoParam | LtoCli::Thin | LtoCli::Fat => early_error(
+                error_format,
+                "options `-C embed-bitcode=no` and `-C lto` are incompatible",
+            ),
+        }
     }
 
     let prints = collect_print_requests(&mut cg, &mut debugging_opts, matches, error_format);
@@ -1814,6 +1878,7 @@ fn parse_pretty(
                 }
             }
         };
+        tracing::debug!("got unpretty option: {:?}", first);
         first
     }
 }
@@ -1942,11 +2007,11 @@ impl PpMode {
         use PpMode::*;
         use PpSourceMode::*;
         match *self {
-            PpmSource(PpmNormal) | PpmSource(PpmEveryBodyLoops) | PpmSource(PpmIdentified) => false,
+            PpmSource(PpmNormal | PpmIdentified) => false,
 
-            PpmSource(PpmExpanded)
-            | PpmSource(PpmExpandedIdentified)
-            | PpmSource(PpmExpandedHygiene)
+            PpmSource(
+                PpmExpanded | PpmEveryBodyLoops | PpmExpandedIdentified | PpmExpandedHygiene,
+            )
             | PpmHir(_)
             | PpmHirTree(_)
             | PpmMir
@@ -1985,14 +2050,15 @@ impl PpMode {
 crate mod dep_tracking {
     use super::{
         CFGuard, CrateType, DebugInfo, ErrorOutputType, LinkerPluginLto, LtoCli, OptLevel,
-        OutputTypes, Passes, Sanitizer, SourceFileHashAlgorithm, SwitchWithOptPath,
+        OutputTypes, Passes, SanitizerSet, SourceFileHashAlgorithm, SwitchWithOptPath,
         SymbolManglingVersion,
     };
     use crate::lint;
-    use crate::utils::NativeLibraryKind;
+    use crate::utils::NativeLibKind;
     use rustc_feature::UnstableFeatures;
     use rustc_span::edition::Edition;
-    use rustc_target::spec::{MergeFunctions, PanicStrategy, RelroLevel, TargetTriple};
+    use rustc_target::spec::{CodeModel, MergeFunctions, PanicStrategy, RelocModel};
+    use rustc_target::spec::{RelroLevel, TargetTriple, TlsModel};
     use std::collections::hash_map::DefaultHasher;
     use std::collections::BTreeMap;
     use std::hash::Hash;
@@ -2040,11 +2106,13 @@ crate mod dep_tracking {
     impl_dep_tracking_hash_via_hash!(Option<(String, u64)>);
     impl_dep_tracking_hash_via_hash!(Option<Vec<String>>);
     impl_dep_tracking_hash_via_hash!(Option<MergeFunctions>);
+    impl_dep_tracking_hash_via_hash!(Option<RelocModel>);
+    impl_dep_tracking_hash_via_hash!(Option<CodeModel>);
+    impl_dep_tracking_hash_via_hash!(Option<TlsModel>);
     impl_dep_tracking_hash_via_hash!(Option<PanicStrategy>);
     impl_dep_tracking_hash_via_hash!(Option<RelroLevel>);
     impl_dep_tracking_hash_via_hash!(Option<lint::Level>);
     impl_dep_tracking_hash_via_hash!(Option<PathBuf>);
-    impl_dep_tracking_hash_via_hash!(Option<NativeLibraryKind>);
     impl_dep_tracking_hash_via_hash!(CrateType);
     impl_dep_tracking_hash_via_hash!(MergeFunctions);
     impl_dep_tracking_hash_via_hash!(PanicStrategy);
@@ -2055,9 +2123,8 @@ crate mod dep_tracking {
     impl_dep_tracking_hash_via_hash!(DebugInfo);
     impl_dep_tracking_hash_via_hash!(UnstableFeatures);
     impl_dep_tracking_hash_via_hash!(OutputTypes);
-    impl_dep_tracking_hash_via_hash!(NativeLibraryKind);
-    impl_dep_tracking_hash_via_hash!(Sanitizer);
-    impl_dep_tracking_hash_via_hash!(Option<Sanitizer>);
+    impl_dep_tracking_hash_via_hash!(NativeLibKind);
+    impl_dep_tracking_hash_via_hash!(SanitizerSet);
     impl_dep_tracking_hash_via_hash!(CFGuard);
     impl_dep_tracking_hash_via_hash!(TargetTriple);
     impl_dep_tracking_hash_via_hash!(Edition);
@@ -2070,13 +2137,8 @@ crate mod dep_tracking {
     impl_dep_tracking_hash_for_sortable_vec_of!(PathBuf);
     impl_dep_tracking_hash_for_sortable_vec_of!(CrateType);
     impl_dep_tracking_hash_for_sortable_vec_of!((String, lint::Level));
-    impl_dep_tracking_hash_for_sortable_vec_of!((
-        String,
-        Option<String>,
-        Option<NativeLibraryKind>
-    ));
+    impl_dep_tracking_hash_for_sortable_vec_of!((String, Option<String>, NativeLibKind));
     impl_dep_tracking_hash_for_sortable_vec_of!((String, u64));
-    impl_dep_tracking_hash_for_sortable_vec_of!(Sanitizer);
 
     impl<T1, T2> DepTrackingHash for (T1, T2)
     where

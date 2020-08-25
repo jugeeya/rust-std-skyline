@@ -72,9 +72,6 @@ pub enum AtomicOrdering {
 }
 
 pub enum SynchronizationScope {
-    // FIXME: figure out if this variant is needed at all.
-    #[allow(dead_code)]
-    Other,
     SingleThread,
     CrossThread,
 }
@@ -98,6 +95,8 @@ pub enum TypeKind {
     Metadata,
     X86_MMX,
     Token,
+    ScalableVector,
+    BFloat,
 }
 
 // FIXME(mw): Anything that is produced via DepGraph::with_task() must implement

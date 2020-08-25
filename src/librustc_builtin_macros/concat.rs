@@ -1,4 +1,4 @@
-use rustc_ast::ast;
+use rustc_ast as ast;
 use rustc_ast::tokenstream::TokenStream;
 use rustc_expand::base::{self, DummyResult};
 use rustc_span::symbol::Symbol;
@@ -26,9 +26,12 @@ pub fn expand_concat(
                 ast::LitKind::Char(c) => {
                     accumulator.push(c);
                 }
-                ast::LitKind::Int(i, ast::LitIntType::Unsigned(_))
-                | ast::LitKind::Int(i, ast::LitIntType::Signed(_))
-                | ast::LitKind::Int(i, ast::LitIntType::Unsuffixed) => {
+                ast::LitKind::Int(
+                    i,
+                    ast::LitIntType::Unsigned(_)
+                    | ast::LitIntType::Signed(_)
+                    | ast::LitIntType::Unsuffixed,
+                ) => {
                     accumulator.push_str(&i.to_string());
                 }
                 ast::LitKind::Bool(b) => {

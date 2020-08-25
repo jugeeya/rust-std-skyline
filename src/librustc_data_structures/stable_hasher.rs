@@ -210,6 +210,12 @@ impl<CTX> HashStable<CTX> for ::std::num::NonZeroU32 {
     }
 }
 
+impl<CTX> HashStable<CTX> for ::std::num::NonZeroUsize {
+    fn hash_stable(&self, ctx: &mut CTX, hasher: &mut StableHasher) {
+        self.get().hash_stable(ctx, hasher)
+    }
+}
+
 impl<CTX> HashStable<CTX> for f32 {
     fn hash_stable(&self, ctx: &mut CTX, hasher: &mut StableHasher) {
         let val: u32 = unsafe { ::std::mem::transmute(*self) };
@@ -460,6 +466,15 @@ impl<I: vec::Idx, CTX> HashStable<CTX> for bit_set::BitSet<I> {
 impl<R: vec::Idx, C: vec::Idx, CTX> HashStable<CTX> for bit_set::BitMatrix<R, C> {
     fn hash_stable(&self, ctx: &mut CTX, hasher: &mut StableHasher) {
         self.words().hash_stable(ctx, hasher);
+    }
+}
+
+impl<T, CTX> HashStable<CTX> for bit_set::FiniteBitSet<T>
+where
+    T: HashStable<CTX> + bit_set::FiniteBitSetTy,
+{
+    fn hash_stable(&self, hcx: &mut CTX, hasher: &mut StableHasher) {
+        self.0.hash_stable(hcx, hasher);
     }
 }
 

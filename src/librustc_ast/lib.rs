@@ -7,16 +7,19 @@
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/", test(attr(deny(warnings))))]
 #![feature(bool_to_option)]
 #![feature(box_syntax)]
-#![feature(const_if_match)]
 #![feature(const_fn)] // For the `transmute` in `P::new`
 #![feature(const_panic)]
-#![feature(const_transmute)]
+#![feature(const_fn_transmute)]
 #![feature(crate_visibility_modifier)]
 #![feature(label_break_value)]
 #![feature(nll)]
+#![feature(or_patterns)]
 #![feature(try_trait)]
 #![feature(unicode_internals)]
 #![recursion_limit = "256"]
+
+#[macro_use]
+extern crate rustc_macros;
 
 #[macro_export]
 macro_rules! unwrap_or {
@@ -33,13 +36,11 @@ pub mod util {
     pub mod comments;
     pub mod lev_distance;
     pub mod literal;
-    pub mod map_in_place;
     pub mod parser;
 }
 
 pub mod ast;
 pub mod attr;
-pub use attr::{with_default_globals, with_globals, GLOBALS};
 pub mod crate_disambiguator;
 pub mod entry;
 pub mod expand;
@@ -49,6 +50,8 @@ pub mod ptr;
 pub mod token;
 pub mod tokenstream;
 pub mod visit;
+
+pub use self::ast::*;
 
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 

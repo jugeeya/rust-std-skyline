@@ -90,6 +90,7 @@
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/")]
 #![feature(never_type)]
 #![feature(nll)]
+#![feature(or_patterns)]
 #![feature(in_band_lifetimes)]
 #![recursion_limit = "256"]
 
@@ -105,9 +106,7 @@ use rustc_middle::ty::subst::SubstsRef;
 use rustc_middle::ty::{self, Instance, TyCtxt};
 use rustc_session::config::SymbolManglingVersion;
 
-use rustc_span::symbol::Symbol;
-
-use log::debug;
+use tracing::debug;
 
 mod legacy;
 mod v0;
@@ -125,14 +124,14 @@ pub fn symbol_name_for_instance_in_crate(
     compute_symbol_name(tcx, instance, || instantiating_crate)
 }
 
-pub fn provide(providers: &mut Providers<'_>) {
+pub fn provide(providers: &mut Providers) {
     *providers = Providers { symbol_name: symbol_name_provider, ..*providers };
 }
 
 // The `symbol_name` query provides the symbol name for calling a given
 // instance from the local crate. In particular, it will also look up the
 // correct symbol name of instances from upstream crates.
-fn symbol_name_provider(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> ty::SymbolName {
+fn symbol_name_provider(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> ty::SymbolName<'tcx> {
     let symbol_name = compute_symbol_name(tcx, instance, || {
         // This closure determines the instantiating crate for instances that
         // need an instantiating-crate-suffix for their symbol name, in order
@@ -148,7 +147,7 @@ fn symbol_name_provider(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> ty::Symb
         }
     });
 
-    ty::SymbolName { name: Symbol::intern(&symbol_name) }
+    ty::SymbolName::new(tcx, &symbol_name)
 }
 
 /// Computes the symbol name for the given instance. This function will call
@@ -164,22 +163,18 @@ fn compute_symbol_name(
 
     debug!("symbol_name(def_id={:?}, substs={:?})", def_id, substs);
 
-    let hir_id = tcx.hir().as_local_hir_id(def_id);
-
-    if def_id.is_local() {
-        if tcx.plugin_registrar_fn(LOCAL_CRATE) == Some(def_id) {
+    // FIXME(eddyb) Precompute a custom symbol name based on attributes.
+    let is_foreign = if let Some(def_id) = def_id.as_local() {
+        if tcx.plugin_registrar_fn(LOCAL_CRATE) == Some(def_id.to_def_id()) {
             let disambiguator = tcx.sess.local_crate_disambiguator();
             return tcx.sess.generate_plugin_registrar_symbol(disambiguator);
         }
-        if tcx.proc_macro_decls_static(LOCAL_CRATE) == Some(def_id) {
+        if tcx.proc_macro_decls_static(LOCAL_CRATE) == Some(def_id.to_def_id()) {
             let disambiguator = tcx.sess.local_crate_disambiguator();
             return tcx.sess.generate_proc_macro_decls_symbol(disambiguator);
         }
-    }
-
-    // FIXME(eddyb) Precompute a custom symbol name based on attributes.
-    let is_foreign = if let Some(id) = hir_id {
-        match tcx.hir().get(id) {
+        let hir_id = tcx.hir().local_def_id_to_hir_id(def_id);
+        match tcx.hir().get(hir_id) {
             Node::ForeignItem(_) => true,
             _ => false,
         }

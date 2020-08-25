@@ -1,8 +1,9 @@
 use crate::ty::context::TyCtxt;
+use crate::ty::WithOptConstParam;
 use measureme::{StringComponent, StringId};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::profiling::SelfProfiler;
-use rustc_hir::def_id::{CrateNum, DefId, DefIndex, CRATE_DEF_INDEX, LOCAL_CRATE};
+use rustc_hir::def_id::{CrateNum, DefId, DefIndex, LocalDefId, CRATE_DEF_INDEX, LOCAL_CRATE};
 use rustc_hir::definitions::DefPathData;
 use rustc_query_system::query::QueryCache;
 use rustc_query_system::query::QueryState;
@@ -60,12 +61,12 @@ impl<'p, 'c, 'tcx> QueryKeyStringBuilder<'p, 'c, 'tcx> {
 
         match def_key.disambiguated_data.data {
             DefPathData::CrateRoot => {
-                name = self.tcx.original_crate_name(def_id.krate).as_str();
+                name = self.tcx.original_crate_name(def_id.krate);
                 dis = "";
                 end_index = 3;
             }
             other => {
-                name = other.as_symbol().as_str();
+                name = other.as_symbol();
                 if def_key.disambiguated_data.disambiguator == 0 {
                     dis = "";
                     end_index = 3;
@@ -79,10 +80,11 @@ impl<'p, 'c, 'tcx> QueryKeyStringBuilder<'p, 'c, 'tcx> {
             }
         }
 
+        let name = &*name.as_str();
         let components = [
             StringComponent::Ref(parent_string_id),
             StringComponent::Value("::"),
-            StringComponent::Value(&name[..]),
+            StringComponent::Value(name),
             StringComponent::Value(dis),
         ];
 
@@ -112,30 +114,96 @@ impl<T: Debug> IntoSelfProfilingString for T {
     }
 }
 
-impl IntoSelfProfilingString for DefId {
+impl<T: SpecIntoSelfProfilingString> IntoSelfProfilingString for T {
     fn to_self_profile_string(&self, builder: &mut QueryKeyStringBuilder<'_, '_, '_>) -> StringId {
+        self.spec_to_self_profile_string(builder)
+    }
+}
+
+#[rustc_specialization_trait]
+pub trait SpecIntoSelfProfilingString: Debug {
+    fn spec_to_self_profile_string(
+        &self,
+        builder: &mut QueryKeyStringBuilder<'_, '_, '_>,
+    ) -> StringId;
+}
+
+impl SpecIntoSelfProfilingString for DefId {
+    fn spec_to_self_profile_string(
+        &self,
+        builder: &mut QueryKeyStringBuilder<'_, '_, '_>,
+    ) -> StringId {
         builder.def_id_to_string_id(*self)
     }
 }
 
-impl IntoSelfProfilingString for CrateNum {
-    fn to_self_profile_string(&self, builder: &mut QueryKeyStringBuilder<'_, '_, '_>) -> StringId {
+impl SpecIntoSelfProfilingString for CrateNum {
+    fn spec_to_self_profile_string(
+        &self,
+        builder: &mut QueryKeyStringBuilder<'_, '_, '_>,
+    ) -> StringId {
         builder.def_id_to_string_id(DefId { krate: *self, index: CRATE_DEF_INDEX })
     }
 }
 
-impl IntoSelfProfilingString for DefIndex {
-    fn to_self_profile_string(&self, builder: &mut QueryKeyStringBuilder<'_, '_, '_>) -> StringId {
+impl SpecIntoSelfProfilingString for DefIndex {
+    fn spec_to_self_profile_string(
+        &self,
+        builder: &mut QueryKeyStringBuilder<'_, '_, '_>,
+    ) -> StringId {
         builder.def_id_to_string_id(DefId { krate: LOCAL_CRATE, index: *self })
     }
 }
 
-impl<T0, T1> IntoSelfProfilingString for (T0, T1)
+impl SpecIntoSelfProfilingString for LocalDefId {
+    fn spec_to_self_profile_string(
+        &self,
+        builder: &mut QueryKeyStringBuilder<'_, '_, '_>,
+    ) -> StringId {
+        builder.def_id_to_string_id(DefId { krate: LOCAL_CRATE, index: self.local_def_index })
+    }
+}
+
+impl<T: SpecIntoSelfProfilingString> SpecIntoSelfProfilingString for WithOptConstParam<T> {
+    fn spec_to_self_profile_string(
+        &self,
+        builder: &mut QueryKeyStringBuilder<'_, '_, '_>,
+    ) -> StringId {
+        // We print `WithOptConstParam` values as tuples to make them shorter
+        // and more readable, without losing information:
+        //
+        // "WithOptConstParam { did: foo::bar, const_param_did: Some(foo::baz) }"
+        // becomes "(foo::bar, foo::baz)" and
+        // "WithOptConstParam { did: foo::bar, const_param_did: None }"
+        // becomes "(foo::bar, _)".
+
+        let did = StringComponent::Ref(self.did.to_self_profile_string(builder));
+
+        let const_param_did = if let Some(const_param_did) = self.const_param_did {
+            let const_param_did = builder.def_id_to_string_id(const_param_did);
+            StringComponent::Ref(const_param_did)
+        } else {
+            StringComponent::Value("_")
+        };
+
+        let components = [
+            StringComponent::Value("("),
+            did,
+            StringComponent::Value(", "),
+            const_param_did,
+            StringComponent::Value(")"),
+        ];
+
+        builder.profiler.alloc_string(&components[..])
+    }
+}
+
+impl<T0, T1> SpecIntoSelfProfilingString for (T0, T1)
 where
-    T0: IntoSelfProfilingString + Debug,
-    T1: IntoSelfProfilingString + Debug,
+    T0: SpecIntoSelfProfilingString,
+    T1: SpecIntoSelfProfilingString,
 {
-    default fn to_self_profile_string(
+    fn spec_to_self_profile_string(
         &self,
         builder: &mut QueryKeyStringBuilder<'_, '_, '_>,
     ) -> StringId {

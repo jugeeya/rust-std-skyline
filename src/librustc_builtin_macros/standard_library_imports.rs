@@ -1,8 +1,8 @@
+use rustc_ast as ast;
 use rustc_ast::ptr::P;
-use rustc_ast::{ast, attr};
-use rustc_expand::base::{ExtCtxt, Resolver};
+use rustc_expand::base::{ExtCtxt, ResolverExpand};
 use rustc_expand::expand::ExpansionConfig;
-use rustc_session::parse::ParseSess;
+use rustc_session::Session;
 use rustc_span::edition::Edition;
 use rustc_span::hygiene::AstPass;
 use rustc_span::symbol::{kw, sym, Ident, Symbol};
@@ -10,17 +10,17 @@ use rustc_span::DUMMY_SP;
 
 pub fn inject(
     mut krate: ast::Crate,
-    resolver: &mut dyn Resolver,
-    sess: &ParseSess,
+    resolver: &mut dyn ResolverExpand,
+    sess: &Session,
     alt_std_name: Option<Symbol>,
 ) -> (ast::Crate, Option<Symbol>) {
-    let rust_2018 = sess.edition >= Edition::Edition2018;
+    let rust_2018 = sess.parse_sess.edition >= Edition::Edition2018;
 
     // the first name in this list is the crate name of the crate with the prelude
-    let names: &[Symbol] = if attr::contains_name(&krate.attrs, sym::no_core) {
+    let names: &[Symbol] = if sess.contains_name(&krate.attrs, sym::no_core) {
         return (krate, None);
-    } else if attr::contains_name(&krate.attrs, sym::no_std) {
-        if attr::contains_name(&krate.attrs, sym::compiler_builtins) {
+    } else if sess.contains_name(&krate.attrs, sym::no_std) {
+        if sess.contains_name(&krate.attrs, sym::compiler_builtins) {
             &[sym::core]
         } else {
             &[sym::core, sym::compiler_builtins]
@@ -60,17 +60,17 @@ pub fn inject(
     let name = names[0];
 
     let import_path = if rust_2018 {
-        [name, sym::prelude, sym::v1].iter().map(|symbol| ast::Ident::new(*symbol, span)).collect()
+        [name, sym::prelude, sym::v1].iter().map(|symbol| Ident::new(*symbol, span)).collect()
     } else {
         [kw::PathRoot, name, sym::prelude, sym::v1]
             .iter()
-            .map(|symbol| ast::Ident::new(*symbol, span))
+            .map(|symbol| Ident::new(*symbol, span))
             .collect()
     };
 
     let use_item = cx.item(
         span,
-        ast::Ident::invalid(),
+        Ident::invalid(),
         vec![cx.attribute(cx.meta_word(span, sym::prelude_import))],
         ast::ItemKind::Use(P(ast::UseTree {
             prefix: cx.path(span, import_path),

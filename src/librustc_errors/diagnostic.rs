@@ -9,7 +9,7 @@ use rustc_span::{MultiSpan, Span, DUMMY_SP};
 use std::fmt;
 
 #[must_use]
-#[derive(Clone, Debug, PartialEq, Hash, RustcEncodable, RustcDecodable)]
+#[derive(Clone, Debug, PartialEq, Hash, Encodable, Decodable)]
 pub struct Diagnostic {
     pub level: Level,
     pub message: Vec<(String, Style)>,
@@ -24,14 +24,14 @@ pub struct Diagnostic {
     pub sort_span: Span,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, RustcEncodable, RustcDecodable)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Encodable, Decodable)]
 pub enum DiagnosticId {
     Error(String),
     Lint(String),
 }
 
 /// For example a note attached to an error.
-#[derive(Clone, Debug, PartialEq, Hash, RustcEncodable, RustcDecodable)]
+#[derive(Clone, Debug, PartialEq, Hash, Encodable, Decodable)]
 pub struct SubDiagnostic {
     pub level: Level,
     pub message: Vec<(String, Style)>,
@@ -127,14 +127,15 @@ impl Diagnostic {
     }
 
     /// Adds a span/label to be included in the resulting snippet.
-    /// This label will be shown together with the original span/label used when creating the
-    /// diagnostic, *not* a span added by one of the `span_*` methods.
     ///
-    /// This is pushed onto the `MultiSpan` that was created when the
-    /// diagnostic was first built. If you don't call this function at
-    /// all, and you just supplied a `Span` to create the diagnostic,
-    /// then the snippet will just include that `Span`, which is
-    /// called the primary span.
+    /// This is pushed onto the [`MultiSpan`] that was created when the diagnostic
+    /// was first built. That means it will be shown together with the original
+    /// span/label, *not* a span added by one of the `span_{note,warn,help,suggestions}` methods.
+    ///
+    /// This span is *not* considered a ["primary span"][`MultiSpan`]; only
+    /// the `Span` supplied when creating the diagnostic is primary.
+    ///
+    /// [`MultiSpan`]: ../rustc_span/struct.MultiSpan.html
     pub fn span_label<T: Into<String>>(&mut self, span: Span, label: T) -> &mut Self {
         self.span.push_span_label(span, label.into());
         self
@@ -193,9 +194,18 @@ impl Diagnostic {
         expected_extra: &dyn fmt::Display,
         found_extra: &dyn fmt::Display,
     ) -> &mut Self {
-        let expected_label = format!("expected {}", expected_label);
-
-        let found_label = format!("found {}", found_label);
+        let expected_label = expected_label.to_string();
+        let expected_label = if expected_label.is_empty() {
+            "expected".to_string()
+        } else {
+            format!("expected {}", expected_label)
+        };
+        let found_label = found_label.to_string();
+        let found_label = if found_label.is_empty() {
+            "found".to_string()
+        } else {
+            format!("found {}", found_label)
+        };
         let (found_padding, expected_padding) = if expected_label.len() > found_label.len() {
             (expected_label.len() - found_label.len(), 0)
         } else {
@@ -280,6 +290,29 @@ impl Diagnostic {
                     .map(|(span, snippet)| SubstitutionPart { snippet, span })
                     .collect(),
             }],
+            msg: msg.to_owned(),
+            style: SuggestionStyle::ShowCode,
+            applicability,
+        });
+        self
+    }
+
+    pub fn multipart_suggestions(
+        &mut self,
+        msg: &str,
+        suggestions: Vec<Vec<(Span, String)>>,
+        applicability: Applicability,
+    ) -> &mut Self {
+        self.suggestions.push(CodeSuggestion {
+            substitutions: suggestions
+                .into_iter()
+                .map(|suggestion| Substitution {
+                    parts: suggestion
+                        .into_iter()
+                        .map(|(span, snippet)| SubstitutionPart { snippet, span })
+                        .collect(),
+                })
+                .collect(),
             msg: msg.to_owned(),
             style: SuggestionStyle::ShowCode,
             applicability,

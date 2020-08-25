@@ -6,9 +6,9 @@
 //! just peeks and looks for that attribute.
 
 use crate::bug;
-use rustc_ast::ast;
-use rustc_data_structures::sync::Once;
-use rustc_session::Session;
+use rustc_ast as ast;
+use rustc_data_structures::sync::OnceCell;
+use rustc_session::{Limit, Session};
 use rustc_span::symbol::{sym, Symbol};
 
 use std::num::IntErrorKind;
@@ -22,19 +22,19 @@ pub fn update_limits(sess: &Session, krate: &ast::Crate) {
 fn update_limit(
     sess: &Session,
     krate: &ast::Crate,
-    limit: &Once<usize>,
+    limit: &OnceCell<Limit>,
     name: Symbol,
     default: usize,
 ) {
     for attr in &krate.attrs {
-        if !attr.check_name(name) {
+        if !sess.check_name(attr, name) {
             continue;
         }
 
         if let Some(s) = attr.value_str() {
             match s.as_str().parse() {
                 Ok(n) => {
-                    limit.set(n);
+                    limit.set(Limit::new(n)).unwrap();
                     return;
                 }
                 Err(e) => {
@@ -62,5 +62,5 @@ fn update_limit(
             }
         }
     }
-    limit.set(default);
+    limit.set(Limit::new(default)).unwrap();
 }

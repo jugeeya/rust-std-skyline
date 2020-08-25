@@ -47,7 +47,7 @@ impl DefPathBasedNames<'tcx> {
             }
             ty::Tuple(component_types) => {
                 output.push('(');
-                for &component_type in component_types {
+                for component_type in component_types {
                     self.push_type_name(component_type.expect_ty(), output, debug);
                     output.push_str(", ");
                 }
@@ -144,13 +144,14 @@ impl DefPathBasedNames<'tcx> {
                 let substs = substs.truncate_to(self.tcx, generics);
                 self.push_generic_params(substs, iter::empty(), output, debug);
             }
-            ty::Error
+            ty::Param(_) => {
+                output.push_str(&t.to_string());
+            }
+            ty::Error(_)
             | ty::Bound(..)
             | ty::Infer(_)
             | ty::Placeholder(..)
-            | ty::UnnormalizedProjection(..)
             | ty::Projection(..)
-            | ty::Param(_)
             | ty::GeneratorWitness(_)
             | ty::Opaque(..) => {
                 if debug {

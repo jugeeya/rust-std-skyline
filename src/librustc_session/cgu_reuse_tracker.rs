@@ -2,10 +2,10 @@
 //! compilation. This is used for incremental compilation tests and debug
 //! output.
 
-use log::debug;
 use rustc_data_structures::fx::FxHashMap;
-use rustc_span::Span;
+use rustc_span::{Span, Symbol};
 use std::sync::{Arc, Mutex};
+use tracing::debug;
 
 #[derive(Copy, Clone, Debug, PartialEq, PartialOrd)]
 pub enum CguReuse {
@@ -67,7 +67,7 @@ impl CguReuseTracker {
 
     pub fn set_expectation(
         &self,
-        cgu_name: &str,
+        cgu_name: Symbol,
         cgu_user_name: &str,
         error_span: Span,
         expected_reuse: CguReuse,

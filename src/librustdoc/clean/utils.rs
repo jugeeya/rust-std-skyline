@@ -2,9 +2,9 @@ use crate::clean::auto_trait::AutoTraitFinder;
 use crate::clean::blanket_impl::BlanketImplFinder;
 use crate::clean::{
     inline, Clean, Crate, Deprecation, ExternalCrate, FnDecl, FnRetTy, Generic, GenericArg,
-    GenericArgs, GenericBound, Generics, GetDefId, ImportSource, Item, ItemEnum, MacroKind, Path,
-    PathSegment, Primitive, PrimitiveType, ResolvedPath, Span, Stability, Type, TypeBinding,
-    TypeKind, Visibility, WherePredicate,
+    GenericArgs, GenericBound, Generics, GetDefId, ImportSource, Item, ItemEnum, Lifetime,
+    MacroKind, Path, PathSegment, Primitive, PrimitiveType, ResolvedPath, Span, Stability, Type,
+    TypeBinding, TypeKind, Visibility, WherePredicate,
 };
 use crate::core::DocContext;
 
@@ -121,7 +121,10 @@ pub fn external_generic_args(
     let args: Vec<_> = substs
         .iter()
         .filter_map(|kind| match kind.unpack() {
-            GenericArgKind::Lifetime(lt) => lt.clean(cx).map(GenericArg::Lifetime),
+            GenericArgKind::Lifetime(lt) => match lt {
+                ty::ReLateBound(_, ty::BrAnon(_)) => Some(GenericArg::Lifetime(Lifetime::elided())),
+                _ => lt.clean(cx).map(GenericArg::Lifetime),
+            },
             GenericArgKind::Type(_) if skip_self => {
                 skip_self = false;
                 None
@@ -208,10 +211,10 @@ pub fn get_real_types(
                             if !adds.is_empty() {
                                 res.extend(adds);
                             } else if !ty.is_full_generic() {
-                                if let Some(did) = ty.def_id() {
-                                    if let Some(kind) = cx.tcx.def_kind(did).clean(cx) {
-                                        res.insert((ty, kind));
-                                    }
+                                if let Some(kind) =
+                                    ty.def_id().map(|did| cx.tcx.def_kind(did).clean(cx))
+                                {
+                                    res.insert((ty, kind));
                                 }
                             }
                         }
@@ -226,20 +229,16 @@ pub fn get_real_types(
                     if !adds.is_empty() {
                         res.extend(adds);
                     } else if !ty.is_full_generic() {
-                        if let Some(did) = ty.def_id() {
-                            if let Some(kind) = cx.tcx.def_kind(did).clean(cx) {
-                                res.insert((ty.clone(), kind));
-                            }
+                        if let Some(kind) = ty.def_id().map(|did| cx.tcx.def_kind(did).clean(cx)) {
+                            res.insert((ty.clone(), kind));
                         }
                     }
                 }
             }
         }
     } else {
-        if let Some(did) = arg.def_id() {
-            if let Some(kind) = cx.tcx.def_kind(did).clean(cx) {
-                res.insert((arg.clone(), kind));
-            }
+        if let Some(kind) = arg.def_id().map(|did| cx.tcx.def_kind(did).clean(cx)) {
+            res.insert((arg.clone(), kind));
         }
         if let Some(gens) = arg.generics() {
             for gen in gens.iter() {
@@ -248,10 +247,8 @@ pub fn get_real_types(
                     if !adds.is_empty() {
                         res.extend(adds);
                     }
-                } else if let Some(did) = gen.def_id() {
-                    if let Some(kind) = cx.tcx.def_kind(did).clean(cx) {
-                        res.insert((gen.clone(), kind));
-                    }
+                } else if let Some(kind) = gen.def_id().map(|did| cx.tcx.def_kind(did).clean(cx)) {
+                    res.insert((gen.clone(), kind));
                 }
             }
         }
@@ -277,10 +274,8 @@ pub fn get_all_types(
         if !args.is_empty() {
             all_types.extend(args);
         } else {
-            if let Some(did) = arg.type_.def_id() {
-                if let Some(kind) = cx.tcx.def_kind(did).clean(cx) {
-                    all_types.insert((arg.type_.clone(), kind));
-                }
+            if let Some(kind) = arg.type_.def_id().map(|did| cx.tcx.def_kind(did).clean(cx)) {
+                all_types.insert((arg.type_.clone(), kind));
             }
         }
     }
@@ -289,10 +284,8 @@ pub fn get_all_types(
         FnRetTy::Return(ref return_type) => {
             let mut ret = get_real_types(generics, &return_type, cx, 0);
             if ret.is_empty() {
-                if let Some(did) = return_type.def_id() {
-                    if let Some(kind) = cx.tcx.def_kind(did).clean(cx) {
-                        ret.insert((return_type.clone(), kind));
-                    }
+                if let Some(kind) = return_type.def_id().map(|did| cx.tcx.def_kind(did).clean(cx)) {
+                    ret.insert((return_type.clone(), kind));
                 }
             }
             ret.into_iter().collect()
@@ -338,10 +331,11 @@ pub fn strip_path(path: &Path) -> Path {
     Path { global: path.global, res: path.res, segments }
 }
 
-pub fn qpath_to_string(p: &hir::QPath) -> String {
+pub fn qpath_to_string(p: &hir::QPath<'_>) -> String {
     let segments = match *p {
         hir::QPath::Resolved(_, ref path) => &path.segments,
         hir::QPath::TypeRelative(_, ref segment) => return segment.ident.to_string(),
+        hir::QPath::LangItem(lang_item, ..) => return lang_item.name().to_string(),
     };
 
     let mut s = String::new();
@@ -357,7 +351,6 @@ pub fn qpath_to_string(p: &hir::QPath) -> String {
 }
 
 pub fn build_deref_target_impls(cx: &DocContext<'_>, items: &[Item], ret: &mut Vec<Item>) {
-    use self::PrimitiveType::*;
     let tcx = cx.tcx;
 
     for item in items {
@@ -376,34 +369,7 @@ pub fn build_deref_target_impls(cx: &DocContext<'_>, items: &[Item], ret: &mut V
                 None => continue,
             },
         };
-        let did = match primitive {
-            Isize => tcx.lang_items().isize_impl(),
-            I8 => tcx.lang_items().i8_impl(),
-            I16 => tcx.lang_items().i16_impl(),
-            I32 => tcx.lang_items().i32_impl(),
-            I64 => tcx.lang_items().i64_impl(),
-            I128 => tcx.lang_items().i128_impl(),
-            Usize => tcx.lang_items().usize_impl(),
-            U8 => tcx.lang_items().u8_impl(),
-            U16 => tcx.lang_items().u16_impl(),
-            U32 => tcx.lang_items().u32_impl(),
-            U64 => tcx.lang_items().u64_impl(),
-            U128 => tcx.lang_items().u128_impl(),
-            F32 => tcx.lang_items().f32_impl(),
-            F64 => tcx.lang_items().f64_impl(),
-            Char => tcx.lang_items().char_impl(),
-            Bool => tcx.lang_items().bool_impl(),
-            Str => tcx.lang_items().str_impl(),
-            Slice => tcx.lang_items().slice_impl(),
-            Array => tcx.lang_items().slice_impl(),
-            Tuple => None,
-            Unit => None,
-            RawPointer => tcx.lang_items().const_ptr_impl(),
-            Reference => None,
-            Fn => None,
-            Never => None,
-        };
-        if let Some(did) = did {
+        for &did in primitive.impls(tcx) {
             if !did.is_local() {
                 inline::build_impl(cx, did, None, ret);
             }
@@ -427,7 +393,7 @@ impl ToSource for rustc_span::Span {
     }
 }
 
-pub fn name_from_pat(p: &hir::Pat) -> String {
+pub fn name_from_pat(p: &hir::Pat<'_>) -> String {
     use rustc_hir::*;
     debug!("trying to get a name from pattern: {:?}", p);
 
@@ -476,11 +442,12 @@ pub fn name_from_pat(p: &hir::Pat) -> String {
 
 pub fn print_const(cx: &DocContext<'_>, n: &'tcx ty::Const<'_>) -> String {
     match n.val {
-        ty::ConstKind::Unevaluated(def_id, _, promoted) => {
-            let mut s = if let Some(hir_id) = cx.tcx.hir().as_local_hir_id(def_id) {
+        ty::ConstKind::Unevaluated(def, _, promoted) => {
+            let mut s = if let Some(def) = def.as_local() {
+                let hir_id = cx.tcx.hir().local_def_id_to_hir_id(def.did);
                 print_const_expr(cx, cx.tcx.hir().body_owned_by(hir_id))
             } else {
-                inline::print_inlined_const(cx, def_id)
+                inline::print_inlined_const(cx, def.did)
             };
             if let Some(promoted) = promoted {
                 s.push_str(&format!("::{:?}", promoted))
@@ -490,8 +457,8 @@ pub fn print_const(cx: &DocContext<'_>, n: &'tcx ty::Const<'_>) -> String {
         _ => {
             let mut s = n.to_string();
             // array lengths are obviously usize
-            if s.ends_with("usize") {
-                let n = s.len() - "usize".len();
+            if s.ends_with("_usize") {
+                let n = s.len() - "_usize".len();
                 s.truncate(n);
                 if s.ends_with(": ") {
                     let n = s.len() - ": ".len();
@@ -580,11 +547,7 @@ pub fn print_const_expr(cx: &DocContext<'_>, body: hir::BodyId) -> String {
 
 /// Given a type Path, resolve it to a Type using the TyCtxt
 pub fn resolve_type(cx: &DocContext<'_>, path: Path, id: hir::HirId) -> Type {
-    if id == hir::DUMMY_HIR_ID {
-        debug!("resolve_type({:?})", path);
-    } else {
-        debug!("resolve_type({:?},{:?})", path, id);
-    }
+    debug!("resolve_type({:?},{:?})", path, id);
 
     let is_generic = match path.res {
         Res::PrimTy(p) => return Primitive(PrimitiveType::from(p)),
@@ -594,7 +557,7 @@ pub fn resolve_type(cx: &DocContext<'_>, path: Path, id: hir::HirId) -> Type {
         Res::Def(DefKind::TyParam, _) if path.segments.len() == 1 => {
             return Generic(format!("{:#}", path.print()));
         }
-        Res::SelfTy(..) | Res::Def(DefKind::TyParam, _) | Res::Def(DefKind::AssocTy, _) => true,
+        Res::SelfTy(..) | Res::Def(DefKind::TyParam | DefKind::AssocTy, _) => true,
         _ => false,
     };
     let did = register_res(&*cx, path.res);
@@ -620,6 +583,9 @@ pub fn register_res(cx: &DocContext<'_>, res: Res) -> DefId {
         Res::Def(DefKind::TyAlias, i) => (i, TypeKind::Typedef),
         Res::Def(DefKind::Enum, i) => (i, TypeKind::Enum),
         Res::Def(DefKind::Trait, i) => (i, TypeKind::Trait),
+        Res::Def(DefKind::AssocTy | DefKind::AssocFn | DefKind::AssocConst, i) => {
+            (cx.tcx.parent(i).unwrap(), TypeKind::Trait)
+        }
         Res::Def(DefKind::Struct, i) => (i, TypeKind::Struct),
         Res::Def(DefKind::Union, i) => (i, TypeKind::Union),
         Res::Def(DefKind::Mod, i) => (i, TypeKind::Module),

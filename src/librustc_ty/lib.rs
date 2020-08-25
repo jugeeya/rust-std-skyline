@@ -12,7 +12,7 @@
 #[macro_use]
 extern crate rustc_middle;
 #[macro_use]
-extern crate log;
+extern crate tracing;
 
 use rustc_middle::ty::query::Providers;
 
@@ -21,7 +21,7 @@ pub mod instance;
 mod needs_drop;
 mod ty;
 
-pub fn provide(providers: &mut Providers<'_>) {
+pub fn provide(providers: &mut Providers) {
     common_traits::provide(providers);
     needs_drop::provide(providers);
     ty::provide(providers);

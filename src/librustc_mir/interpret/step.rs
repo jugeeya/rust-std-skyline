@@ -29,7 +29,7 @@ fn binop_right_homogeneous(op: mir::BinOp) -> bool {
     }
 }
 
-impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
+impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
     pub fn run(&mut self) -> InterpResult<'tcx> {
         while self.step()? {}
         Ok(())
@@ -42,13 +42,13 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
     /// This is marked `#inline(always)` to work around adverserial codegen when `opt-level = 3`
     #[inline(always)]
     pub fn step(&mut self) -> InterpResult<'tcx, bool> {
-        if self.stack.is_empty() {
+        if self.stack().is_empty() {
             return Ok(false);
         }
 
-        let block = match self.frame().block {
-            Some(block) => block,
-            None => {
+        let loc = match self.frame().loc {
+            Ok(loc) => loc,
+            Err(_) => {
                 // We are unwinding and this fn has no cleanup code.
                 // Just go on unwinding.
                 trace!("unwinding: skipping frame");
@@ -56,14 +56,12 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 return Ok(true);
             }
         };
-        let stmt_id = self.frame().stmt;
-        let body = self.body();
-        let basic_block = &body.basic_blocks()[block];
+        let basic_block = &self.body().basic_blocks()[loc.block];
 
-        let old_frames = self.cur_frame();
+        let old_frames = self.frame_idx();
 
-        if let Some(stmt) = basic_block.statements.get(stmt_id) {
-            assert_eq!(old_frames, self.cur_frame());
+        if let Some(stmt) = basic_block.statements.get(loc.statement_index) {
+            assert_eq!(old_frames, self.frame_idx());
             self.statement(stmt)?;
             return Ok(true);
         }
@@ -71,27 +69,28 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         M::before_terminator(self)?;
 
         let terminator = basic_block.terminator();
-        assert_eq!(old_frames, self.cur_frame());
+        assert_eq!(old_frames, self.frame_idx());
         self.terminator(terminator)?;
         Ok(true)
     }
 
-    fn statement(&mut self, stmt: &mir::Statement<'tcx>) -> InterpResult<'tcx> {
+    /// Runs the interpretation logic for the given `mir::Statement` at the current frame and
+    /// statement counter. This also moves the statement counter forward.
+    crate fn statement(&mut self, stmt: &mir::Statement<'tcx>) -> InterpResult<'tcx> {
         info!("{:?}", stmt);
-        self.set_span(stmt.source_info.span);
 
         use rustc_middle::mir::StatementKind::*;
 
         // Some statements (e.g., box) push new stack frames.
         // We have to record the stack frame number *before* executing the statement.
-        let frame_idx = self.cur_frame();
+        let frame_idx = self.frame_idx();
 
         match &stmt.kind {
             Assign(box (place, rvalue)) => self.eval_rvalue_into_place(rvalue, *place)?,
 
             SetDiscriminant { place, variant_index } => {
                 let dest = self.eval_place(**place)?;
-                self.write_discriminant_index(*variant_index, dest)?;
+                self.write_discriminant(*variant_index, dest)?;
             }
 
             // Mark locals as alive
@@ -119,6 +118,19 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             // Statements we do not track.
             AscribeUserType(..) => {}
 
+            // Currently, Miri discards Coverage statements. Coverage statements are only injected
+            // via an optional compile time MIR pass and have no side effects. Since Coverage
+            // statements don't exist at the source level, it is safe for Miri to ignore them, even
+            // for undefined behavior (UB) checks.
+            //
+            // A coverage counter inside a const expression (for example, a counter injected in a
+            // const function) is discarded when the const is evaluated at compile time. Whether
+            // this should change, and/or how to implement a const eval counter, is a subject of the
+            // following issue:
+            //
+            // FIXME(#73156): Handle source code coverage in const eval
+            Coverage(..) => {}
+
             // Defined to do nothing. These are added by optimization passes, to avoid changing the
             // size of MIR constantly.
             Nop => {}
@@ -126,7 +138,7 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             LlvmInlineAsm { .. } => throw_unsup_format!("inline assembly is not supported"),
         }
 
-        self.stack[frame_idx].stmt += 1;
+        self.stack_mut()[frame_idx].loc.as_mut().unwrap().statement_index += 1;
         Ok(())
     }
 
@@ -143,6 +155,12 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
 
         use rustc_middle::mir::Rvalue::*;
         match *rvalue {
+            ThreadLocalRef(did) => {
+                let id = M::thread_local_static_alloc_id(self, did)?;
+                let val = self.global_base_pointer(id.into())?;
+                self.write_scalar(val, dest)?;
+            }
+
             Use(ref operand) => {
                 // Avoid recomputing the layout
                 let op = self.eval_operand(operand, Some(dest.layout))?;
@@ -176,7 +194,7 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             Aggregate(ref kind, ref operands) => {
                 let (dest, active_field_index) = match **kind {
                     mir::AggregateKind::Adt(adt_def, variant_index, _, _, active_field_index) => {
-                        self.write_discriminant_index(variant_index, dest)?;
+                        self.write_discriminant(variant_index, dest)?;
                         if adt_def.is_enum() {
                             (self.place_downcast(dest, variant_index)?, active_field_index)
                         } else {
@@ -255,32 +273,31 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 self.write_scalar(Scalar::from_machine_usize(layout.size.bytes(), self), dest)?;
             }
 
-            Cast(kind, ref operand, _) => {
+            Cast(cast_kind, ref operand, cast_ty) => {
                 let src = self.eval_operand(operand, None)?;
-                self.cast(src, kind, dest)?;
+                let cast_ty = self.subst_from_current_frame_and_normalize_erasing_regions(cast_ty);
+                self.cast(src, cast_kind, cast_ty, dest)?;
             }
 
             Discriminant(place) => {
                 let op = self.eval_place_to_op(place, None)?;
                 let discr_val = self.read_discriminant(op)?.0;
-                let size = dest.layout.size;
-                self.write_scalar(Scalar::from_uint(discr_val, size), dest)?;
+                self.write_scalar(discr_val, dest)?;
             }
         }
 
-        self.dump_place(*dest);
+        trace!("{:?}", self.dump_place(*dest));
 
         Ok(())
     }
 
     fn terminator(&mut self, terminator: &mir::Terminator<'tcx>) -> InterpResult<'tcx> {
         info!("{:?}", terminator.kind);
-        self.set_span(terminator.source_info.span);
 
         self.eval_terminator(terminator)?;
-        if !self.stack.is_empty() {
-            if let Some(block) = self.frame().block {
-                info!("// executing {:?}", block);
+        if !self.stack().is_empty() {
+            if let Ok(loc) = self.frame().loc {
+                info!("// executing {:?}", loc.block);
             }
         }
         Ok(())

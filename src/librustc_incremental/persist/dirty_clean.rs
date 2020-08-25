@@ -3,9 +3,9 @@
 //! we will compare the fingerprint from the current and from the previous
 //! compilation session as appropriate:
 //!
-//! - `#[rustc_clean(cfg="rev2", except="typeck_tables_of")]` if we are
+//! - `#[rustc_clean(cfg="rev2", except="typeck")]` if we are
 //!   in `#[cfg(rev2)]`, then the fingerprints associated with
-//!   `DepNode::typeck_tables_of(X)` must be DIFFERENT (`X` is the `DefId` of the
+//!   `DepNode::typeck(X)` must be DIFFERENT (`X` is the `DefId` of the
 //!   current node).
 //! - `#[rustc_clean(cfg="rev2")]` same as above, except that the
 //!   fingerprints must be the SAME (along with all other fingerprints).
@@ -13,7 +13,7 @@
 //! Errors are reported if we are in the suitable configuration but
 //! the required condition is not met.
 
-use rustc_ast::ast::{self, Attribute, NestedMetaItem};
+use rustc_ast::{self as ast, Attribute, NestedMetaItem};
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir as hir;
@@ -48,7 +48,7 @@ const BASE_FN: &[&str] = &[
     label_strs::type_of,
     // And a big part of compilation (that we eventually want to cache) is type inference
     // information:
-    label_strs::typeck_tables_of,
+    label_strs::typeck,
 ];
 
 /// DepNodes for Hir, which is pretty much everything
@@ -64,8 +64,7 @@ const BASE_IMPL: &[&str] =
 
 /// DepNodes for mir_built/Optimized, which is relevant in "executable"
 /// code, i.e., functions+methods
-const BASE_MIR: &[&str] =
-    &[label_strs::optimized_mir, label_strs::promoted_mir, label_strs::mir_built];
+const BASE_MIR: &[&str] = &[label_strs::optimized_mir, label_strs::promoted_mir];
 
 /// Struct, Enum and Union DepNodes
 ///
@@ -168,7 +167,7 @@ pub fn check_dirty_clean_annotations(tcx: TyCtxt<'_>) {
 
         // Note that we cannot use the existing "unused attribute"-infrastructure
         // here, since that is running before codegen. This is also the reason why
-        // all codegen-specific attributes are `Whitelisted` in rustc_ast::feature_gate.
+        // all codegen-specific attributes are `AssumedUsed` in rustc_ast::feature_gate.
         all_attrs.report_unchecked_attrs(&dirty_clean_visitor.checked_attrs);
     })
 }
@@ -181,9 +180,9 @@ pub struct DirtyCleanVisitor<'tcx> {
 impl DirtyCleanVisitor<'tcx> {
     /// Possibly "deserialize" the attribute into a clean/dirty assertion
     fn assertion_maybe(&mut self, item_id: hir::HirId, attr: &Attribute) -> Option<Assertion> {
-        let is_clean = if attr.check_name(sym::rustc_dirty) {
+        let is_clean = if self.tcx.sess.check_name(attr, sym::rustc_dirty) {
             false
-        } else if attr.check_name(sym::rustc_clean) {
+        } else if self.tcx.sess.check_name(attr, sym::rustc_clean) {
             true
         } else {
             // skip: not rustc_clean/dirty
@@ -232,9 +231,9 @@ impl DirtyCleanVisitor<'tcx> {
 
     fn labels(&self, attr: &Attribute) -> Option<Labels> {
         for item in attr.meta_item_list().unwrap_or_else(Vec::new) {
-            if item.check_name(LABEL) {
+            if item.has_name(LABEL) {
                 let value = expect_associated_value(self.tcx, &item);
-                return Some(self.resolve_labels(&item, &value.as_str()));
+                return Some(self.resolve_labels(&item, value));
             }
         }
         None
@@ -243,9 +242,9 @@ impl DirtyCleanVisitor<'tcx> {
     /// `except=` attribute value
     fn except(&self, attr: &Attribute) -> Labels {
         for item in attr.meta_item_list().unwrap_or_else(Vec::new) {
-            if item.check_name(EXCEPT) {
+            if item.has_name(EXCEPT) {
                 let value = expect_associated_value(self.tcx, &item);
-                return self.resolve_labels(&item, &value.as_str());
+                return self.resolve_labels(&item, value);
             }
         }
         // if no `label` or `except` is given, only the node's group are asserted
@@ -336,7 +335,6 @@ impl DirtyCleanVisitor<'tcx> {
                 ImplItemKind::Fn(..) => ("Node::ImplItem", LABELS_FN_IN_IMPL),
                 ImplItemKind::Const(..) => ("NodeImplConst", LABELS_CONST_IN_IMPL),
                 ImplItemKind::TyAlias(..) => ("NodeImplType", LABELS_CONST_IN_IMPL),
-                ImplItemKind::OpaqueTy(..) => ("NodeImplType", LABELS_CONST_IN_IMPL),
             },
             _ => self.tcx.sess.span_fatal(
                 attr.span,
@@ -348,9 +346,9 @@ impl DirtyCleanVisitor<'tcx> {
         (name, labels)
     }
 
-    fn resolve_labels(&self, item: &NestedMetaItem, value: &str) -> Labels {
+    fn resolve_labels(&self, item: &NestedMetaItem, value: Symbol) -> Labels {
         let mut out = Labels::default();
-        for label in value.split(',') {
+        for label in value.as_str().split(',') {
             let label = label.trim();
             if DepNode::has_label_string(label) {
                 if out.contains(label) {
@@ -377,7 +375,7 @@ impl DirtyCleanVisitor<'tcx> {
         let def_path_hash = self.tcx.def_path_hash(def_id);
         labels.iter().map(move |label| match DepNode::from_label_string(label, def_path_hash) {
             Ok(dep_node) => dep_node,
-            Err(()) => unreachable!(),
+            Err(()) => unreachable!("label: {}", label),
         })
     }
 
@@ -434,16 +432,16 @@ impl DirtyCleanVisitor<'tcx> {
 
     fn check_item(&mut self, item_id: hir::HirId, item_span: Span) {
         let def_id = self.tcx.hir().local_def_id(item_id);
-        for attr in self.tcx.get_attrs(def_id).iter() {
+        for attr in self.tcx.get_attrs(def_id.to_def_id()).iter() {
             let assertion = match self.assertion_maybe(item_id, attr) {
                 Some(a) => a,
                 None => continue,
             };
             self.checked_attrs.insert(attr.id);
-            for dep_node in self.dep_nodes(&assertion.clean, def_id) {
+            for dep_node in self.dep_nodes(&assertion.clean, def_id.to_def_id()) {
                 self.assert_clean(item_span, dep_node);
             }
-            for dep_node in self.dep_nodes(&assertion.dirty, def_id) {
+            for dep_node in self.dep_nodes(&assertion.dirty, def_id.to_def_id()) {
                 self.assert_dirty(item_span, dep_node);
             }
         }
@@ -476,15 +474,15 @@ fn check_config(tcx: TyCtxt<'_>, attr: &Attribute) -> bool {
     debug!("check_config: config={:?}", config);
     let (mut cfg, mut except, mut label) = (None, false, false);
     for item in attr.meta_item_list().unwrap_or_else(Vec::new) {
-        if item.check_name(CFG) {
+        if item.has_name(CFG) {
             let value = expect_associated_value(tcx, &item);
             debug!("check_config: searching for cfg {:?}", value);
             cfg = Some(config.contains(&(value, None)));
         }
-        if item.check_name(LABEL) {
+        if item.has_name(LABEL) {
             label = true;
         }
-        if item.check_name(EXCEPT) {
+        if item.has_name(EXCEPT) {
             except = true;
         }
     }
@@ -499,7 +497,7 @@ fn check_config(tcx: TyCtxt<'_>, attr: &Attribute) -> bool {
     }
 }
 
-fn expect_associated_value(tcx: TyCtxt<'_>, item: &NestedMetaItem) -> ast::Name {
+fn expect_associated_value(tcx: TyCtxt<'_>, item: &NestedMetaItem) -> Symbol {
     if let Some(value) = item.value_str() {
         value
     } else {
@@ -525,7 +523,7 @@ pub struct FindAllAttrs<'tcx> {
 impl FindAllAttrs<'tcx> {
     fn is_active_attr(&mut self, attr: &Attribute) -> bool {
         for attr_name in &self.attr_names {
-            if attr.check_name(*attr_name) && check_config(self.tcx, attr) {
+            if self.tcx.sess.check_name(attr, *attr_name) && check_config(self.tcx, attr) {
                 return true;
             }
         }

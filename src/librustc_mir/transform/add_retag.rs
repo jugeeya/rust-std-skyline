@@ -58,10 +58,14 @@ fn may_be_reference(ty: Ty<'tcx>) -> bool {
 }
 
 impl<'tcx> MirPass<'tcx> for AddRetag {
-    fn run_pass(&self, tcx: TyCtxt<'tcx>, _src: MirSource<'tcx>, body: &mut BodyAndCache<'tcx>) {
+    fn run_pass(&self, tcx: TyCtxt<'tcx>, src: MirSource<'tcx>, body: &mut Body<'tcx>) {
         if !tcx.sess.opts.debugging_opts.mir_emit_retag {
             return;
         }
+
+        // We need an `AllCallEdges` pass before we can do any work.
+        super::add_call_guards::AllCallEdges.run_pass(tcx, src, body);
+
         let (span, arg_count) = (body.span, body.arg_count);
         let (basic_blocks, local_decls) = body.basic_blocks_and_local_decls_mut();
         let needs_retag = |place: &Place<'tcx>| {
@@ -73,23 +77,20 @@ impl<'tcx> MirPass<'tcx> for AddRetag {
         // PART 1
         // Retag arguments at the beginning of the start block.
         {
-            let source_info = SourceInfo {
-                scope: OUTERMOST_SOURCE_SCOPE,
-                span, // FIXME: Consider using just the span covering the function
-                      // argument declaration.
-            };
+            // FIXME: Consider using just the span covering the function
+            // argument declaration.
+            let source_info = SourceInfo::outermost(span);
             // Gather all arguments, skip return value.
             let places = local_decls
                 .iter_enumerated()
                 .skip(1)
                 .take(arg_count)
                 .map(|(local, _)| Place::from(local))
-                .filter(needs_retag)
-                .collect::<Vec<_>>();
+                .filter(needs_retag);
             // Emit their retags.
             basic_blocks[START_BLOCK].statements.splice(
                 0..0,
-                places.into_iter().map(|place| Statement {
+                places.map(|place| Statement {
                     source_info,
                     kind: StatementKind::Retag(RetagKind::FnEntry, box (place)),
                 }),
@@ -99,29 +100,24 @@ impl<'tcx> MirPass<'tcx> for AddRetag {
         // PART 2
         // Retag return values of functions.  Also escape-to-raw the argument of `drop`.
         // We collect the return destinations because we cannot mutate while iterating.
-        let mut returns: Vec<(SourceInfo, Place<'tcx>, BasicBlock)> = Vec::new();
-        for block_data in basic_blocks.iter_mut() {
-            match block_data.terminator().kind {
-                TerminatorKind::Call { ref destination, .. } => {
-                    // Remember the return destination for later
-                    if let Some(ref destination) = destination {
-                        if needs_retag(&destination.0) {
-                            returns.push((
-                                block_data.terminator().source_info,
-                                destination.0,
-                                destination.1,
-                            ));
-                        }
+        let returns = basic_blocks
+            .iter_mut()
+            .filter_map(|block_data| {
+                match block_data.terminator().kind {
+                    TerminatorKind::Call { destination: Some(ref destination), .. }
+                        if needs_retag(&destination.0) =>
+                    {
+                        // Remember the return destination for later
+                        Some((block_data.terminator().source_info, destination.0, destination.1))
                     }
-                }
-                TerminatorKind::Drop { .. } | TerminatorKind::DropAndReplace { .. } => {
+
                     // `Drop` is also a call, but it doesn't return anything so we are good.
-                }
-                _ => {
+                    TerminatorKind::Drop { .. } | TerminatorKind::DropAndReplace { .. } => None,
                     // Not a block ending in a Call -> ignore.
+                    _ => None,
                 }
-            }
-        }
+            })
+            .collect::<Vec<_>>();
         // Now we go over the returns we collected to retag the return values.
         for (source_info, dest_place, dest_block) in returns {
             basic_blocks[dest_block].statements.insert(

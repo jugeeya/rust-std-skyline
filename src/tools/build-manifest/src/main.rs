@@ -4,10 +4,7 @@
 //! via `x.py dist hash-and-sign`; the cmdline arguments are set up
 //! by rustbuild (in `src/bootstrap/dist.rs`).
 
-#![deny(warnings)]
-
 use serde::Serialize;
-use toml;
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -37,11 +34,13 @@ static HOSTS: &[&str] = &[
     "powerpc-unknown-linux-gnu",
     "powerpc64-unknown-linux-gnu",
     "powerpc64le-unknown-linux-gnu",
+    "riscv64gc-unknown-linux-gnu",
     "s390x-unknown-linux-gnu",
     "x86_64-apple-darwin",
     "x86_64-pc-windows-gnu",
     "x86_64-pc-windows-msvc",
     "x86_64-unknown-freebsd",
+    "x86_64-unknown-illumos",
     "x86_64-unknown-linux-gnu",
     "x86_64-unknown-linux-musl",
     "x86_64-unknown-netbsd",
@@ -139,6 +138,7 @@ static TARGETS: &[&str] = &[
     "x86_64-pc-solaris",
     "x86_64-unknown-cloudabi",
     "x86_64-unknown-freebsd",
+    "x86_64-unknown-illumos",
     "x86_64-unknown-linux-gnu",
     "x86_64-unknown-linux-gnux32",
     "x86_64-unknown-linux-musl",
@@ -156,9 +156,12 @@ static DOCS_TARGETS: &[&str] = &[
     "x86_64-pc-windows-gnu",
     "x86_64-pc-windows-msvc",
     "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
 ];
 
 static MINGW: &[&str] = &["i686-pc-windows-gnu", "x86_64-pc-windows-gnu"];
+
+static NIGHTLY_ONLY_COMPONENTS: &[&str] = &["miri-preview", "rust-analyzer-preview"];
 
 #[derive(Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -224,10 +227,10 @@ struct Builder {
     rust_release: String,
     cargo_release: String,
     rls_release: String,
+    rust_analyzer_release: String,
     clippy_release: String,
     rustfmt_release: String,
     llvm_tools_release: String,
-    lldb_release: String,
     miri_release: String,
 
     input: PathBuf,
@@ -240,19 +243,19 @@ struct Builder {
     rust_version: Option<String>,
     cargo_version: Option<String>,
     rls_version: Option<String>,
+    rust_analyzer_version: Option<String>,
     clippy_version: Option<String>,
     rustfmt_version: Option<String>,
     llvm_tools_version: Option<String>,
-    lldb_version: Option<String>,
     miri_version: Option<String>,
 
     rust_git_commit_hash: Option<String>,
     cargo_git_commit_hash: Option<String>,
     rls_git_commit_hash: Option<String>,
+    rust_analyzer_git_commit_hash: Option<String>,
     clippy_git_commit_hash: Option<String>,
     rustfmt_git_commit_hash: Option<String>,
     llvm_tools_git_commit_hash: Option<String>,
-    lldb_git_commit_hash: Option<String>,
     miri_git_commit_hash: Option<String>,
 
     should_sign: bool,
@@ -279,11 +282,11 @@ fn main() {
     let s3_address = args.next().unwrap();
     let cargo_release = args.next().unwrap();
     let rls_release = args.next().unwrap();
+    let rust_analyzer_release = args.next().unwrap();
     let clippy_release = args.next().unwrap();
     let miri_release = args.next().unwrap();
     let rustfmt_release = args.next().unwrap();
     let llvm_tools_release = args.next().unwrap();
-    let lldb_release = args.next().unwrap();
 
     // Do not ask for a passphrase while manually testing
     let mut passphrase = String::new();
@@ -296,10 +299,10 @@ fn main() {
         rust_release,
         cargo_release,
         rls_release,
+        rust_analyzer_release,
         clippy_release,
         rustfmt_release,
         llvm_tools_release,
-        lldb_release,
         miri_release,
 
         input,
@@ -312,19 +315,19 @@ fn main() {
         rust_version: None,
         cargo_version: None,
         rls_version: None,
+        rust_analyzer_version: None,
         clippy_version: None,
         rustfmt_version: None,
         llvm_tools_version: None,
-        lldb_version: None,
         miri_version: None,
 
         rust_git_commit_hash: None,
         cargo_git_commit_hash: None,
         rls_git_commit_hash: None,
+        rust_analyzer_git_commit_hash: None,
         clippy_git_commit_hash: None,
         rustfmt_git_commit_hash: None,
         llvm_tools_git_commit_hash: None,
-        lldb_git_commit_hash: None,
         miri_git_commit_hash: None,
 
         should_sign,
@@ -336,10 +339,10 @@ enum PkgType {
     RustSrc,
     Cargo,
     Rls,
+    RustAnalyzer,
     Clippy,
     Rustfmt,
     LlvmTools,
-    Lldb,
     Miri,
     Other,
 }
@@ -351,10 +354,10 @@ impl PkgType {
             "rust-src" => RustSrc,
             "cargo" => Cargo,
             "rls" | "rls-preview" => Rls,
+            "rust-analyzer" | "rust-analyzer-preview" => RustAnalyzer,
             "clippy" | "clippy-preview" => Clippy,
             "rustfmt" | "rustfmt-preview" => Rustfmt,
             "llvm-tools" | "llvm-tools-preview" => LlvmTools,
-            "lldb" | "lldb-preview" => Lldb,
             "miri" | "miri-preview" => Miri,
             _ => Other,
         }
@@ -366,21 +369,21 @@ impl Builder {
         self.rust_version = self.version("rust", "x86_64-unknown-linux-gnu");
         self.cargo_version = self.version("cargo", "x86_64-unknown-linux-gnu");
         self.rls_version = self.version("rls", "x86_64-unknown-linux-gnu");
+        self.rust_analyzer_version = self.version("rust-analyzer", "x86_64-unknown-linux-gnu");
         self.clippy_version = self.version("clippy", "x86_64-unknown-linux-gnu");
         self.rustfmt_version = self.version("rustfmt", "x86_64-unknown-linux-gnu");
         self.llvm_tools_version = self.version("llvm-tools", "x86_64-unknown-linux-gnu");
-        // lldb is only built for macOS.
-        self.lldb_version = self.version("lldb", "x86_64-apple-darwin");
         self.miri_version = self.version("miri", "x86_64-unknown-linux-gnu");
 
         self.rust_git_commit_hash = self.git_commit_hash("rust", "x86_64-unknown-linux-gnu");
         self.cargo_git_commit_hash = self.git_commit_hash("cargo", "x86_64-unknown-linux-gnu");
         self.rls_git_commit_hash = self.git_commit_hash("rls", "x86_64-unknown-linux-gnu");
+        self.rust_analyzer_git_commit_hash =
+            self.git_commit_hash("rust-analyzer", "x86_64-unknown-linux-gnu");
         self.clippy_git_commit_hash = self.git_commit_hash("clippy", "x86_64-unknown-linux-gnu");
         self.rustfmt_git_commit_hash = self.git_commit_hash("rustfmt", "x86_64-unknown-linux-gnu");
         self.llvm_tools_git_commit_hash =
             self.git_commit_hash("llvm-tools", "x86_64-unknown-linux-gnu");
-        self.lldb_git_commit_hash = self.git_commit_hash("lldb", "x86_64-unknown-linux-gnu");
         self.miri_git_commit_hash = self.git_commit_hash("miri", "x86_64-unknown-linux-gnu");
 
         self.check_toolstate();
@@ -444,18 +447,19 @@ impl Builder {
         let mut package = |name, targets| self.package(name, &mut manifest.pkg, targets);
         package("rustc", HOSTS);
         package("rustc-dev", HOSTS);
+        package("rustc-docs", HOSTS);
         package("cargo", HOSTS);
         package("rust-mingw", MINGW);
         package("rust-std", TARGETS);
         package("rust-docs", DOCS_TARGETS);
         package("rust-src", &["*"]);
         package("rls-preview", HOSTS);
+        package("rust-analyzer-preview", HOSTS);
         package("clippy-preview", HOSTS);
         package("miri-preview", HOSTS);
         package("rustfmt-preview", HOSTS);
         package("rust-analysis", TARGETS);
         package("llvm-tools-preview", TARGETS);
-        package("lldb-preview", TARGETS);
     }
 
     fn add_profiles_to(&mut self, manifest: &mut Manifest) {
@@ -484,9 +488,9 @@ impl Builder {
                 "rustfmt-preview",
                 "clippy-preview",
                 "rls-preview",
+                "rust-analyzer-preview",
                 "rust-src",
                 "llvm-tools-preview",
-                "lldb-preview",
                 "rust-analysis",
                 "miri-preview",
             ],
@@ -497,6 +501,7 @@ impl Builder {
         // for users to install the additional component manually, if needed.
         if self.rust_release == "nightly" {
             self.extend_profile("complete", &mut manifest.profiles, &["rustc-dev"]);
+            self.extend_profile("complete", &mut manifest.profiles, &["rustc-docs"]);
         }
     }
 
@@ -559,9 +564,9 @@ impl Builder {
             host_component("clippy-preview"),
             host_component("miri-preview"),
             host_component("rls-preview"),
+            host_component("rust-analyzer-preview"),
             host_component("rustfmt-preview"),
             host_component("llvm-tools-preview"),
-            host_component("lldb-preview"),
             host_component("rust-analysis"),
         ]);
 
@@ -572,6 +577,7 @@ impl Builder {
                 .map(|target| Component::from_str("rust-std", target)),
         );
         extensions.extend(HOSTS.iter().map(|target| Component::from_str("rustc-dev", target)));
+        extensions.extend(HOSTS.iter().map(|target| Component::from_str("rustc-docs", target)));
         extensions.push(Component::from_str("rust-src", "*"));
 
         // If the components/extensions don't actually exist for this
@@ -629,8 +635,8 @@ impl Builder {
             .map(|version| (version, true))
             .unwrap_or_default(); // `is_present` defaults to `false` here.
 
-        // Miri is nightly-only; never ship it for other trains.
-        if pkgname == "miri-preview" && self.rust_release != "nightly" {
+        // Never ship nightly-only components for other trains.
+        if self.rust_release != "nightly" && NIGHTLY_ONLY_COMPONENTS.contains(&pkgname) {
             is_present = false; // Pretend the component is entirely missing.
         }
 
@@ -688,10 +694,12 @@ impl Builder {
             RustSrc => format!("rust-src-{}.tar.gz", self.rust_release),
             Cargo => format!("cargo-{}-{}.tar.gz", self.cargo_release, target),
             Rls => format!("rls-{}-{}.tar.gz", self.rls_release, target),
+            RustAnalyzer => {
+                format!("rust-analyzer-{}-{}.tar.gz", self.rust_analyzer_release, target)
+            }
             Clippy => format!("clippy-{}-{}.tar.gz", self.clippy_release, target),
             Rustfmt => format!("rustfmt-{}-{}.tar.gz", self.rustfmt_release, target),
             LlvmTools => format!("llvm-tools-{}-{}.tar.gz", self.llvm_tools_release, target),
-            Lldb => format!("lldb-{}-{}.tar.gz", self.lldb_release, target),
             Miri => format!("miri-{}-{}.tar.gz", self.miri_release, target),
             Other => format!("{}-{}-{}.tar.gz", component, self.rust_release, target),
         }
@@ -702,10 +710,10 @@ impl Builder {
         match PkgType::from_component(component) {
             Cargo => &self.cargo_version,
             Rls => &self.rls_version,
+            RustAnalyzer => &self.rust_analyzer_version,
             Clippy => &self.clippy_version,
             Rustfmt => &self.rustfmt_version,
             LlvmTools => &self.llvm_tools_version,
-            Lldb => &self.lldb_version,
             Miri => &self.miri_version,
             _ => &self.rust_version,
         }
@@ -716,10 +724,10 @@ impl Builder {
         match PkgType::from_component(component) {
             Cargo => &self.cargo_git_commit_hash,
             Rls => &self.rls_git_commit_hash,
+            RustAnalyzer => &self.rust_analyzer_git_commit_hash,
             Clippy => &self.clippy_git_commit_hash,
             Rustfmt => &self.rustfmt_git_commit_hash,
             LlvmTools => &self.llvm_tools_git_commit_hash,
-            Lldb => &self.lldb_git_commit_hash,
             Miri => &self.miri_git_commit_hash,
             _ => &self.rust_git_commit_hash,
         }

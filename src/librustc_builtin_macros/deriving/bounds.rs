@@ -2,7 +2,7 @@ use crate::deriving::generic::ty::*;
 use crate::deriving::generic::*;
 use crate::deriving::path_std;
 
-use rustc_ast::ast::MetaItem;
+use rustc_ast::MetaItem;
 use rustc_expand::base::{Annotatable, ExtCtxt};
 use rustc_span::Span;
 
@@ -16,9 +16,9 @@ pub fn expand_deriving_copy(
     let trait_def = TraitDef {
         span,
         attributes: Vec::new(),
-        path: path_std!(cx, marker::Copy),
+        path: path_std!(marker::Copy),
         additional_bounds: Vec::new(),
-        generics: LifetimeBounds::empty(),
+        generics: Bounds::empty(),
         is_unsafe: false,
         supports_unions: true,
         methods: Vec::new(),

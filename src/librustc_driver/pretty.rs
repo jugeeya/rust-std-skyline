@@ -1,6 +1,6 @@
 //! The various pretty-printing routines.
 
-use rustc_ast::ast;
+use rustc_ast as ast;
 use rustc_ast_pretty::pprust;
 use rustc_errors::ErrorReported;
 use rustc_hir as hir;
@@ -11,6 +11,7 @@ use rustc_middle::ty::{self, TyCtxt};
 use rustc_mir::util::{write_mir_graphviz, write_mir_pretty};
 use rustc_session::config::{Input, PpMode, PpSourceMode};
 use rustc_session::Session;
+use rustc_span::symbol::Ident;
 use rustc_span::FileName;
 
 use std::cell::Cell;
@@ -79,8 +80,7 @@ where
         PpmTyped => {
             abort_on_err(tcx.analysis(LOCAL_CRATE), tcx.sess);
 
-            let empty_tables = ty::TypeckTables::empty(None);
-            let annotation = TypedAnnotation { tcx, tables: Cell::new(&empty_tables) };
+            let annotation = TypedAnnotation { tcx, maybe_typeck_results: Cell::new(None) };
             tcx.dep_graph.with_ignore(|| f(&annotation, tcx.hir().krate()))
         }
         _ => panic!("Should use call_with_pp_support"),
@@ -284,7 +284,7 @@ impl<'a> PrinterSupport for HygieneAnnotation<'a> {
 impl<'a> pprust::PpAnn for HygieneAnnotation<'a> {
     fn post(&self, s: &mut pprust::State<'_>, node: pprust::AnnNode<'_>) {
         match node {
-            pprust::AnnNode::Ident(&ast::Ident { name, span }) => {
+            pprust::AnnNode::Ident(&Ident { name, span }) => {
                 s.s.space();
                 s.synth_comment(format!("{}{:?}", name.as_u32(), span.ctxt()))
             }
@@ -303,12 +303,24 @@ impl<'a> pprust::PpAnn for HygieneAnnotation<'a> {
     }
 }
 
-struct TypedAnnotation<'a, 'tcx> {
+struct TypedAnnotation<'tcx> {
     tcx: TyCtxt<'tcx>,
-    tables: Cell<&'a ty::TypeckTables<'tcx>>,
+    maybe_typeck_results: Cell<Option<&'tcx ty::TypeckResults<'tcx>>>,
 }
 
-impl<'b, 'tcx> HirPrinterSupport<'tcx> for TypedAnnotation<'b, 'tcx> {
+impl<'tcx> TypedAnnotation<'tcx> {
+    /// Gets the type-checking results for the current body.
+    /// As this will ICE if called outside bodies, only call when working with
+    /// `Expr` or `Pat` nodes (they are guaranteed to be found only in bodies).
+    #[track_caller]
+    fn typeck_results(&self) -> &'tcx ty::TypeckResults<'tcx> {
+        self.maybe_typeck_results
+            .get()
+            .expect("`TypedAnnotation::typeck_results` called outside of body")
+    }
+}
+
+impl<'tcx> HirPrinterSupport<'tcx> for TypedAnnotation<'tcx> {
     fn sess(&self) -> &Session {
         &self.tcx.sess
     }
@@ -322,19 +334,19 @@ impl<'b, 'tcx> HirPrinterSupport<'tcx> for TypedAnnotation<'b, 'tcx> {
     }
 
     fn node_path(&self, id: hir::HirId) -> Option<String> {
-        Some(self.tcx.def_path_str(self.tcx.hir().local_def_id(id)))
+        Some(self.tcx.def_path_str(self.tcx.hir().local_def_id(id).to_def_id()))
     }
 }
 
-impl<'a, 'tcx> pprust_hir::PpAnn for TypedAnnotation<'a, 'tcx> {
+impl<'tcx> pprust_hir::PpAnn for TypedAnnotation<'tcx> {
     fn nested(&self, state: &mut pprust_hir::State<'_>, nested: pprust_hir::Nested) {
-        let old_tables = self.tables.get();
+        let old_maybe_typeck_results = self.maybe_typeck_results.get();
         if let pprust_hir::Nested::Body(id) = nested {
-            self.tables.set(self.tcx.body_tables(id));
+            self.maybe_typeck_results.set(Some(self.tcx.typeck_body(id)));
         }
         let pp_ann = &(&self.tcx.hir() as &dyn hir::intravisit::Map<'_>);
         pprust_hir::PpAnn::nested(pp_ann, state, nested);
-        self.tables.set(old_tables);
+        self.maybe_typeck_results.set(old_maybe_typeck_results);
     }
     fn pre(&self, s: &mut pprust_hir::State<'_>, node: pprust_hir::AnnNode<'_>) {
         if let pprust_hir::AnnNode::Expr(_) = node {
@@ -346,7 +358,7 @@ impl<'a, 'tcx> pprust_hir::PpAnn for TypedAnnotation<'a, 'tcx> {
             s.s.space();
             s.s.word("as");
             s.s.space();
-            s.s.word(self.tables.get().expr_ty(expr).to_string());
+            s.s.word(self.typeck_results().expr_ty(expr).to_string());
             s.pclose();
         }
     }
@@ -395,7 +407,7 @@ pub fn print_after_parsing(
                 annotation.pp_ann(),
                 false,
                 parse.edition,
-                parse.injected_crate_name.try_get().is_some(),
+                parse.injected_crate_name.get().is_some(),
             )
         })
     } else {
@@ -437,7 +449,7 @@ pub fn print_after_hir_lowering<'tcx>(
                     annotation.pp_ann(),
                     true,
                     parse.edition,
-                    parse.injected_crate_name.try_get().is_some(),
+                    parse.injected_crate_name.get().is_some(),
                 )
             })
         }

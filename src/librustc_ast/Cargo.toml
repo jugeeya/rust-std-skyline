@@ -10,12 +10,12 @@ path = "lib.rs"
 doctest = false
 
 [dependencies]
-rustc_serialize = { path = "../libserialize", package = "serialize" }
-log = "0.4"
-scoped-tls = "1.0"
+rustc_serialize = { path = "../librustc_serialize" }
+tracing = "0.1"
 rustc_span = { path = "../librustc_span" }
 rustc_data_structures = { path = "../librustc_data_structures" }
 rustc_index = { path = "../librustc_index" }
 rustc_lexer = { path = "../librustc_lexer" }
 rustc_macros = { path = "../librustc_macros" }
 smallvec = { version = "1.0", features = ["union", "may_dangle"] }
+bitflags = "1.2.1"

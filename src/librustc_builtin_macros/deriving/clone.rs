@@ -2,10 +2,10 @@ use crate::deriving::generic::ty::*;
 use crate::deriving::generic::*;
 use crate::deriving::path_std;
 
-use rustc_ast::ast::{self, Expr, GenericArg, Generics, ItemKind, MetaItem, VariantData};
 use rustc_ast::ptr::P;
+use rustc_ast::{self as ast, Expr, GenericArg, Generics, ItemKind, MetaItem, VariantData};
 use rustc_expand::base::{Annotatable, ExtCtxt};
-use rustc_span::symbol::{kw, sym, Symbol};
+use rustc_span::symbol::{kw, sym, Ident, Symbol};
 use rustc_span::Span;
 
 pub fn expand_deriving_clone(
@@ -56,7 +56,7 @@ pub fn expand_deriving_clone(
                 }
             }
             ItemKind::Union(..) => {
-                bounds = vec![Literal(path_std!(cx, marker::Copy))];
+                bounds = vec![Literal(path_std!(marker::Copy))];
                 is_shallow = true;
                 substructure = combine_substructure(Box::new(|c, s, sub| {
                     cs_clone_shallow("Clone", c, s, sub, true)
@@ -78,14 +78,14 @@ pub fn expand_deriving_clone(
     let trait_def = TraitDef {
         span,
         attributes: Vec::new(),
-        path: path_std!(cx, clone::Clone),
+        path: path_std!(clone::Clone),
         additional_bounds: bounds,
-        generics: LifetimeBounds::empty(),
+        generics: Bounds::empty(),
         is_unsafe: false,
         supports_unions: true,
         methods: vec![MethodDef {
-            name: "clone",
-            generics: LifetimeBounds::empty(),
+            name: sym::clone,
+            generics: Bounds::empty(),
             explicit_self: borrowed_explicit_self(),
             args: Vec::new(),
             ret_ty: Self_,
@@ -135,8 +135,7 @@ fn cs_clone_shallow(
     let mut stmts = Vec::new();
     if is_union {
         // let _: AssertParamIsCopy<Self>;
-        let self_ty =
-            cx.ty_path(cx.path_ident(trait_span, ast::Ident::with_dummy_span(kw::SelfUpper)));
+        let self_ty = cx.ty_path(cx.path_ident(trait_span, Ident::with_dummy_span(kw::SelfUpper)));
         assert_ty_bounds(cx, &mut stmts, self_ty, trait_span, "AssertParamIsCopy");
     } else {
         match *substr.fields {

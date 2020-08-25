@@ -1,10 +1,10 @@
-use rustc_ast::ast::{self, Attribute, Ident, Mod};
-use rustc_ast::{attr, token};
+use rustc_ast::{token, Attribute, Mod};
 use rustc_errors::{struct_span_err, PResult};
 use rustc_parse::new_parser_from_file;
 use rustc_session::parse::ParseSess;
+use rustc_session::Session;
 use rustc_span::source_map::{FileName, Span};
-use rustc_span::symbol::sym;
+use rustc_span::symbol::{sym, Ident};
 
 use std::path::{self, Path, PathBuf};
 
@@ -18,7 +18,7 @@ pub struct Directory {
 pub enum DirectoryOwnership {
     Owned {
         // None if `mod.rs`, `Some("foo")` if we're in `foo.rs`.
-        relative: Option<ast::Ident>,
+        relative: Option<Ident>,
     },
     UnownedViaBlock,
     UnownedViaMod,
@@ -39,8 +39,8 @@ pub struct ModulePathSuccess {
 }
 
 crate fn parse_external_mod(
-    sess: &ParseSess,
-    id: ast::Ident,
+    sess: &Session,
+    id: Ident,
     span: Span, // The span to blame on errors.
     Directory { mut ownership, path }: Directory,
     attrs: &mut Vec<Attribute>,
@@ -53,14 +53,15 @@ crate fn parse_external_mod(
         ownership = mp.ownership;
 
         // Ensure file paths are acyclic.
-        let mut included_mod_stack = sess.included_mod_stack.borrow_mut();
-        error_on_circular_module(sess, span, &mp.path, &included_mod_stack)?;
+        let mut included_mod_stack = sess.parse_sess.included_mod_stack.borrow_mut();
+        error_on_circular_module(&sess.parse_sess, span, &mp.path, &included_mod_stack)?;
         included_mod_stack.push(mp.path.clone());
         *pop_mod_stack = true; // We have pushed, so notify caller.
         drop(included_mod_stack);
 
         // Actually parse the external file as a module.
-        let mut module = new_parser_from_file(sess, &mp.path, Some(span)).parse_mod(&token::Eof)?;
+        let mut module =
+            new_parser_from_file(&sess.parse_sess, &mp.path, Some(span)).parse_mod(&token::Eof)?;
         module.0.inline = false;
         module
     };
@@ -71,7 +72,7 @@ crate fn parse_external_mod(
     // Extract the directory path for submodules of `module`.
     let path = sess.source_map().span_to_unmapped_path(module.inner);
     let mut path = match path {
-        FileName::Real(path) => path,
+        FileName::Real(name) => name.into_local_path(),
         other => PathBuf::from(other.to_string()),
     };
     path.pop();
@@ -98,11 +99,12 @@ fn error_on_circular_module<'a>(
 }
 
 crate fn push_directory(
+    sess: &Session,
     id: Ident,
     attrs: &[Attribute],
     Directory { mut ownership, mut path }: Directory,
 ) -> Directory {
-    if let Some(filename) = attr::first_attr_value_str_by_name(attrs, sym::path) {
+    if let Some(filename) = sess.first_attr_value_str_by_name(attrs, sym::path) {
         path.push(&*filename.as_str());
         ownership = DirectoryOwnership::Owned { relative: None };
     } else {
@@ -124,14 +126,14 @@ crate fn push_directory(
 }
 
 fn submod_path<'a>(
-    sess: &'a ParseSess,
-    id: ast::Ident,
+    sess: &'a Session,
+    id: Ident,
     span: Span,
     attrs: &[Attribute],
     ownership: DirectoryOwnership,
     dir_path: &Path,
 ) -> PResult<'a, ModulePathSuccess> {
-    if let Some(path) = submod_path_from_attr(attrs, dir_path) {
+    if let Some(path) = submod_path_from_attr(sess, attrs, dir_path) {
         let ownership = match path.file_name().and_then(|s| s.to_str()) {
             // All `#[path]` files are treated as though they are a `mod.rs` file.
             // This means that `mod foo;` declarations inside `#[path]`-included
@@ -151,16 +153,16 @@ fn submod_path<'a>(
         DirectoryOwnership::UnownedViaBlock | DirectoryOwnership::UnownedViaMod => None,
     };
     let ModulePath { path_exists, name, result } =
-        default_submod_path(sess, id, span, relative, dir_path);
+        default_submod_path(&sess.parse_sess, id, span, relative, dir_path);
     match ownership {
         DirectoryOwnership::Owned { .. } => Ok(result?),
         DirectoryOwnership::UnownedViaBlock => {
             let _ = result.map_err(|mut err| err.cancel());
-            error_decl_mod_in_block(sess, span, path_exists, &name)
+            error_decl_mod_in_block(&sess.parse_sess, span, path_exists, &name)
         }
         DirectoryOwnership::UnownedViaMod => {
             let _ = result.map_err(|mut err| err.cancel());
-            error_cannot_declare_mod_here(sess, span, path_exists, &name)
+            error_cannot_declare_mod_here(&sess.parse_sess, span, path_exists, &name)
         }
     }
 }
@@ -189,7 +191,8 @@ fn error_cannot_declare_mod_here<'a, T>(
     let mut err =
         sess.span_diagnostic.struct_span_err(span, "cannot declare a new module at this location");
     if !span.is_dummy() {
-        if let FileName::Real(src_path) = sess.source_map().span_to_filename(span) {
+        if let FileName::Real(src_name) = sess.source_map().span_to_filename(span) {
+            let src_path = src_name.into_local_path();
             if let Some(stem) = src_path.file_stem() {
                 let mut dest_path = src_path.clone();
                 dest_path.set_file_name(stem);
@@ -217,9 +220,13 @@ fn error_cannot_declare_mod_here<'a, T>(
 /// Derive a submodule path from the first found `#[path = "path_string"]`.
 /// The provided `dir_path` is joined with the `path_string`.
 // Public for rustfmt usage.
-pub fn submod_path_from_attr(attrs: &[Attribute], dir_path: &Path) -> Option<PathBuf> {
+pub fn submod_path_from_attr(
+    sess: &Session,
+    attrs: &[Attribute],
+    dir_path: &Path,
+) -> Option<PathBuf> {
     // Extract path string from first `#[path = "path_string"]` attribute.
-    let path_string = attr::first_attr_value_str_by_name(attrs, sym::path)?;
+    let path_string = sess.first_attr_value_str_by_name(attrs, sym::path)?;
     let path_string = path_string.as_str();
 
     // On windows, the base path might have the form
@@ -236,9 +243,9 @@ pub fn submod_path_from_attr(attrs: &[Attribute], dir_path: &Path) -> Option<Pat
 // Public for rustfmt usage.
 pub fn default_submod_path<'a>(
     sess: &'a ParseSess,
-    id: ast::Ident,
+    id: Ident,
     span: Span,
-    relative: Option<ast::Ident>,
+    relative: Option<Ident>,
     dir_path: &Path,
 ) -> ModulePath<'a> {
     // If we're in a foo.rs file instead of a mod.rs file,
@@ -290,7 +297,7 @@ pub fn default_submod_path<'a>(
             let mut err = struct_span_err!(
                 sess.span_diagnostic,
                 span,
-                E0584,
+                E0761,
                 "file for module `{}` found at both {} and {}",
                 mod_name,
                 default_path_str,

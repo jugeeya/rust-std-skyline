@@ -69,16 +69,17 @@ This API is completely unstable and subject to change.
 #![recursion_limit = "256"]
 
 #[macro_use]
-extern crate log;
+extern crate tracing;
 
 #[macro_use]
 extern crate rustc_middle;
 
-// This is used by Clippy.
+// These are used by Clippy.
+pub mod check;
 pub mod expr_use_visitor;
 
 mod astconv;
-mod check;
+mod bounds;
 mod check_unused;
 mod coherence;
 mod collect;
@@ -91,17 +92,16 @@ mod variance;
 
 use rustc_errors::{struct_span_err, ErrorReported};
 use rustc_hir as hir;
-use rustc_hir::def_id::{DefId, LOCAL_CRATE};
+use rustc_hir::def_id::{LocalDefId, LOCAL_CRATE};
 use rustc_hir::Node;
 use rustc_infer::infer::{InferOk, TyCtxtInferExt};
 use rustc_infer::traits::TraitEngineExt as _;
 use rustc_middle::middle;
 use rustc_middle::ty::query::Providers;
-use rustc_middle::ty::subst::SubstsRef;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_middle::util;
 use rustc_session::config::EntryFnType;
-use rustc_span::{Span, DUMMY_SP};
+use rustc_span::{symbol::sym, Span, DUMMY_SP};
 use rustc_target::spec::abi::Abi;
 use rustc_trait_selection::traits::error_reporting::InferCtxtExt as _;
 use rustc_trait_selection::traits::{
@@ -110,11 +110,8 @@ use rustc_trait_selection::traits::{
 
 use std::iter;
 
-use astconv::{AstConv, Bounds};
-pub struct TypeAndSubsts<'tcx> {
-    substs: SubstsRef<'tcx>,
-    ty: Ty<'tcx>,
-}
+use astconv::AstConv;
+use bounds::Bounds;
 
 fn require_c_abi_if_c_variadic(tcx: TyCtxt<'_>, decl: &hir::FnDecl<'_>, abi: Abi, span: Span) {
     if decl.c_variadic && !(abi == Abi::C || abi == Abi::Cdecl) {
@@ -157,14 +154,14 @@ fn require_same_types<'tcx>(
     })
 }
 
-fn check_main_fn_ty(tcx: TyCtxt<'_>, main_def_id: DefId) {
-    let main_id = tcx.hir().as_local_hir_id(main_def_id).unwrap();
+fn check_main_fn_ty(tcx: TyCtxt<'_>, main_def_id: LocalDefId) {
+    let main_id = tcx.hir().local_def_id_to_hir_id(main_def_id);
     let main_span = tcx.def_span(main_def_id);
     let main_t = tcx.type_of(main_def_id);
     match main_t.kind {
         ty::FnDef(..) => {
             if let Some(Node::Item(it)) = tcx.hir().find(main_id) {
-                if let hir::ItemKind::Fn(.., ref generics, _) = it.kind {
+                if let hir::ItemKind::Fn(ref sig, ref generics, _) = it.kind {
                     let mut error = false;
                     if !generics.params.is_empty() {
                         let msg = "`main` function is not allowed to have generic \
@@ -187,6 +184,35 @@ fn check_main_fn_ty(tcx: TyCtxt<'_>, main_def_id: DefId) {
                         .emit();
                         error = true;
                     }
+                    if let hir::IsAsync::Async = sig.header.asyncness {
+                        let span = tcx.sess.source_map().guess_head_span(it.span);
+                        struct_span_err!(
+                            tcx.sess,
+                            span,
+                            E0752,
+                            "`main` function is not allowed to be `async`"
+                        )
+                        .span_label(span, "`main` function is not allowed to be `async`")
+                        .emit();
+                        error = true;
+                    }
+
+                    for attr in it.attrs {
+                        if tcx.sess.check_name(attr, sym::track_caller) {
+                            tcx.sess
+                                .struct_span_err(
+                                    attr.span,
+                                    "`main` function is not allowed to be `#[track_caller]`",
+                                )
+                                .span_label(
+                                    main_span,
+                                    "`main` function is not allowed to be `#[track_caller]`",
+                                )
+                                .emit();
+                            error = true;
+                        }
+                    }
+
                     if error {
                         return;
                     }
@@ -224,14 +250,14 @@ fn check_main_fn_ty(tcx: TyCtxt<'_>, main_def_id: DefId) {
     }
 }
 
-fn check_start_fn_ty(tcx: TyCtxt<'_>, start_def_id: DefId) {
-    let start_id = tcx.hir().as_local_hir_id(start_def_id).unwrap();
+fn check_start_fn_ty(tcx: TyCtxt<'_>, start_def_id: LocalDefId) {
+    let start_id = tcx.hir().local_def_id_to_hir_id(start_def_id);
     let start_span = tcx.def_span(start_def_id);
     let start_t = tcx.type_of(start_def_id);
     match start_t.kind {
         ty::FnDef(..) => {
             if let Some(Node::Item(it)) = tcx.hir().find(start_id) {
-                if let hir::ItemKind::Fn(.., ref generics, _) = it.kind {
+                if let hir::ItemKind::Fn(ref sig, ref generics, _) = it.kind {
                     let mut error = false;
                     if !generics.params.is_empty() {
                         struct_span_err!(
@@ -255,6 +281,35 @@ fn check_start_fn_ty(tcx: TyCtxt<'_>, start_def_id: DefId) {
                         .emit();
                         error = true;
                     }
+                    if let hir::IsAsync::Async = sig.header.asyncness {
+                        let span = tcx.sess.source_map().guess_head_span(it.span);
+                        struct_span_err!(
+                            tcx.sess,
+                            span,
+                            E0752,
+                            "`start` is not allowed to be `async`"
+                        )
+                        .span_label(span, "`start` is not allowed to be `async`")
+                        .emit();
+                        error = true;
+                    }
+
+                    for attr in it.attrs {
+                        if tcx.sess.check_name(attr, sym::track_caller) {
+                            tcx.sess
+                                .struct_span_err(
+                                    attr.span,
+                                    "`start` is not allowed to be `#[track_caller]`",
+                                )
+                                .span_label(
+                                    start_span,
+                                    "`start` is not allowed to be `#[track_caller]`",
+                                )
+                                .emit();
+                            error = true;
+                        }
+                    }
+
                     if error {
                         return;
                     }
@@ -290,7 +345,7 @@ fn check_for_entry_fn(tcx: TyCtxt<'_>) {
     }
 }
 
-pub fn provide(providers: &mut Providers<'_>) {
+pub fn provide(providers: &mut Providers) {
     collect::provide(providers);
     coherence::provide(providers);
     check::provide(providers);
@@ -337,6 +392,7 @@ pub fn check_crate(tcx: TyCtxt<'_>) -> Result<(), ErrorReported> {
         tcx.sess.time("wf_checking", || check::check_wf_new(tcx));
     })?;
 
+    // NOTE: This is copy/pasted in librustdoc/core.rs and should be kept in sync.
     tcx.sess.time("item_types_checking", || {
         for &module in tcx.hir().krate().modules.keys() {
             tcx.ensure().check_mod_item_types(tcx.hir().local_def_id(module));
@@ -359,7 +415,7 @@ pub fn hir_ty_to_ty<'tcx>(tcx: TyCtxt<'tcx>, hir_ty: &hir::Ty<'_>) -> Ty<'tcx> {
     // scope.  This is derived from the enclosing item-like thing.
     let env_node_id = tcx.hir().get_parent_item(hir_ty.hir_id);
     let env_def_id = tcx.hir().local_def_id(env_node_id);
-    let item_cx = self::collect::ItemCtxt::new(tcx, env_def_id);
+    let item_cx = self::collect::ItemCtxt::new(tcx, env_def_id.to_def_id());
 
     astconv::AstConv::ast_ty_to_ty(&item_cx, hir_ty)
 }
@@ -374,7 +430,7 @@ pub fn hir_trait_to_predicates<'tcx>(
     // scope.  This is derived from the enclosing item-like thing.
     let env_hir_id = tcx.hir().get_parent_item(hir_trait.hir_ref_id);
     let env_def_id = tcx.hir().local_def_id(env_hir_id);
-    let item_cx = self::collect::ItemCtxt::new(tcx, env_def_id);
+    let item_cx = self::collect::ItemCtxt::new(tcx, env_def_id.to_def_id());
     let mut bounds = Bounds::default();
     let _ = AstConv::instantiate_poly_trait_ref_inner(
         &item_cx,

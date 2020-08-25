@@ -29,9 +29,8 @@ impl<'tcx> ExplicitPredicatesMap<'tcx> {
 
             // process predicates and convert to `RequiredPredicates` entry, see below
             for &(predicate, span) in predicates.predicates {
-                match predicate {
-                    ty::Predicate::TypeOutlives(predicate) => {
-                        let OutlivesPredicate(ref ty, ref reg) = predicate.skip_binder();
+                match predicate.skip_binders() {
+                    ty::PredicateAtom::TypeOutlives(OutlivesPredicate(ref ty, ref reg)) => {
                         insert_outlives_predicate(
                             tcx,
                             (*ty).into(),
@@ -41,8 +40,7 @@ impl<'tcx> ExplicitPredicatesMap<'tcx> {
                         )
                     }
 
-                    ty::Predicate::RegionOutlives(predicate) => {
-                        let OutlivesPredicate(ref reg1, ref reg2) = predicate.skip_binder();
+                    ty::PredicateAtom::RegionOutlives(OutlivesPredicate(ref reg1, ref reg2)) => {
                         insert_outlives_predicate(
                             tcx,
                             (*reg1).into(),
@@ -52,13 +50,14 @@ impl<'tcx> ExplicitPredicatesMap<'tcx> {
                         )
                     }
 
-                    ty::Predicate::Trait(..)
-                    | ty::Predicate::Projection(..)
-                    | ty::Predicate::WellFormed(..)
-                    | ty::Predicate::ObjectSafe(..)
-                    | ty::Predicate::ClosureKind(..)
-                    | ty::Predicate::Subtype(..)
-                    | ty::Predicate::ConstEvaluatable(..) => (),
+                    ty::PredicateAtom::Trait(..)
+                    | ty::PredicateAtom::Projection(..)
+                    | ty::PredicateAtom::WellFormed(..)
+                    | ty::PredicateAtom::ObjectSafe(..)
+                    | ty::PredicateAtom::ClosureKind(..)
+                    | ty::PredicateAtom::Subtype(..)
+                    | ty::PredicateAtom::ConstEvaluatable(..)
+                    | ty::PredicateAtom::ConstEquate(..) => (),
                 }
             }
 

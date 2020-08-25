@@ -1,14 +1,16 @@
 //! Miscellaneous type-system utilities that are too small to deserve their own modules.
 
 use crate::ich::NodeIdHashingMode;
+use crate::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use crate::mir::interpret::{sign_extend, truncate};
+use crate::ty::fold::TypeFolder;
 use crate::ty::layout::IntegerExt;
 use crate::ty::query::TyCtxtAt;
 use crate::ty::subst::{GenericArgKind, InternalSubsts, Subst, SubstsRef};
 use crate::ty::TyKind::*;
-use crate::ty::{self, DefIdTree, GenericParamDefKind, Ty, TyCtxt, TypeFoldable};
+use crate::ty::{self, DefIdTree, GenericParamDefKind, List, Ty, TyCtxt, TypeFoldable};
 use rustc_apfloat::Float as _;
-use rustc_ast::ast;
+use rustc_ast as ast;
 use rustc_attr::{self as attr, SignedInt, UnsignedInt};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
@@ -16,7 +18,6 @@ use rustc_errors::ErrorReported;
 use rustc_hir as hir;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
-use rustc_hir::definitions::DefPathData;
 use rustc_macros::HashStable;
 use rustc_span::Span;
 use rustc_target::abi::{Integer, Size, TargetDataLayout};
@@ -176,7 +177,7 @@ impl<'tcx> TyCtxt<'tcx> {
         if let ty::Adt(def, substs) = ty.kind {
             for field in def.all_fields() {
                 let field_ty = field.ty(self, substs);
-                if let Error = field_ty.kind {
+                if let Error(_) = field_ty.kind {
                     return true;
                 }
             }
@@ -316,10 +317,8 @@ impl<'tcx> TyCtxt<'tcx> {
                         break;
                     }
                 }
-                (ty::Projection(_), _)
-                | (ty::Opaque(..), _)
-                | (_, ty::Projection(_))
-                | (_, ty::Opaque(..)) => {
+                (ty::Projection(_) | ty::Opaque(..), _)
+                | (_, ty::Projection(_) | ty::Opaque(..)) => {
                     // If either side is a projection, attempt to
                     // progress via normalization. (Should be safe to
                     // apply to both sides as normalization is
@@ -415,7 +414,7 @@ impl<'tcx> TyCtxt<'tcx> {
         let result = item_substs
             .iter()
             .zip(impl_substs.iter())
-            .filter(|&(_, &k)| {
+            .filter(|&(_, k)| {
                 match k.unpack() {
                     GenericArgKind::Lifetime(&ty::RegionKind::ReEarlyBound(ref ebr)) => {
                         !impl_generics.region_param(ebr, self).pure_wrt_drop
@@ -435,7 +434,7 @@ impl<'tcx> TyCtxt<'tcx> {
                     }
                 }
             })
-            .map(|(&item_param, _)| item_param)
+            .map(|(item_param, _)| item_param)
             .collect();
         debug!("destructor_constraint({:?}) = {:?}", def.did, result);
         result
@@ -448,24 +447,24 @@ impl<'tcx> TyCtxt<'tcx> {
     /// those are not yet phased out). The parent of the closure's
     /// `DefId` will also be the context where it appears.
     pub fn is_closure(self, def_id: DefId) -> bool {
-        self.def_key(def_id).disambiguated_data.data == DefPathData::ClosureExpr
+        matches!(self.def_kind(def_id), DefKind::Closure | DefKind::Generator)
     }
 
     /// Returns `true` if `def_id` refers to a trait (i.e., `trait Foo { ... }`).
     pub fn is_trait(self, def_id: DefId) -> bool {
-        self.def_kind(def_id) == Some(DefKind::Trait)
+        self.def_kind(def_id) == DefKind::Trait
     }
 
     /// Returns `true` if `def_id` refers to a trait alias (i.e., `trait Foo = ...;`),
     /// and `false` otherwise.
     pub fn is_trait_alias(self, def_id: DefId) -> bool {
-        self.def_kind(def_id) == Some(DefKind::TraitAlias)
+        self.def_kind(def_id) == DefKind::TraitAlias
     }
 
     /// Returns `true` if this `DefId` refers to the implicit constructor for
     /// a tuple struct like `struct Foo(u32)`, and `false` otherwise.
     pub fn is_constructor(self, def_id: DefId) -> bool {
-        self.def_key(def_id).disambiguated_data.data == DefPathData::Ctor
+        matches!(self.def_kind(def_id), DefKind::Ctor(..))
     }
 
     /// Given the def-ID of a fn or closure, returns the def-ID of
@@ -473,8 +472,8 @@ impl<'tcx> TyCtxt<'tcx> {
     /// This is a significant `DefId` because, when we do
     /// type-checking, we type-check this fn item and all of its
     /// (transitive) closures together. Therefore, when we fetch the
-    /// `typeck_tables_of` the closure, for example, we really wind up
-    /// fetching the `typeck_tables_of` the enclosing fn item.
+    /// `typeck` the closure, for example, we really wind up
+    /// fetching the `typeck` the enclosing fn item.
     pub fn closure_base_def_id(self, def_id: DefId) -> DefId {
         let mut def_id = def_id;
         while self.is_closure(def_id) {
@@ -531,6 +530,11 @@ impl<'tcx> TyCtxt<'tcx> {
         self.static_mutability(def_id).is_some()
     }
 
+    /// Returns `true` if this is a `static` item with the `#[thread_local]` attribute.
+    pub fn is_thread_local_static(&self, def_id: DefId) -> bool {
+        self.codegen_fn_attrs(def_id).flags.contains(CodegenFnAttrFlags::THREAD_LOCAL)
+    }
+
     /// Returns `true` if the node pointed to by `def_id` is a mutable `static` item.
     pub fn is_mutable_static(&self, def_id: DefId) -> bool {
         self.static_mutability(def_id) == Some(hir::Mutability::Mut)
@@ -554,79 +558,81 @@ impl<'tcx> TyCtxt<'tcx> {
         def_id: DefId,
         substs: SubstsRef<'tcx>,
     ) -> Result<Ty<'tcx>, Ty<'tcx>> {
-        use crate::ty::fold::TypeFolder;
-
-        struct OpaqueTypeExpander<'tcx> {
-            // Contains the DefIds of the opaque types that are currently being
-            // expanded. When we expand an opaque type we insert the DefId of
-            // that type, and when we finish expanding that type we remove the
-            // its DefId.
-            seen_opaque_tys: FxHashSet<DefId>,
-            // Cache of all expansions we've seen so far. This is a critical
-            // optimization for some large types produced by async fn trees.
-            expanded_cache: FxHashMap<(DefId, SubstsRef<'tcx>), Ty<'tcx>>,
-            primary_def_id: DefId,
-            found_recursion: bool,
-            tcx: TyCtxt<'tcx>,
-        }
-
-        impl<'tcx> OpaqueTypeExpander<'tcx> {
-            fn expand_opaque_ty(
-                &mut self,
-                def_id: DefId,
-                substs: SubstsRef<'tcx>,
-            ) -> Option<Ty<'tcx>> {
-                if self.found_recursion {
-                    return None;
-                }
-                let substs = substs.fold_with(self);
-                if self.seen_opaque_tys.insert(def_id) {
-                    let expanded_ty = match self.expanded_cache.get(&(def_id, substs)) {
-                        Some(expanded_ty) => expanded_ty,
-                        None => {
-                            let generic_ty = self.tcx.type_of(def_id);
-                            let concrete_ty = generic_ty.subst(self.tcx, substs);
-                            let expanded_ty = self.fold_ty(concrete_ty);
-                            self.expanded_cache.insert((def_id, substs), expanded_ty);
-                            expanded_ty
-                        }
-                    };
-                    self.seen_opaque_tys.remove(&def_id);
-                    Some(expanded_ty)
-                } else {
-                    // If another opaque type that we contain is recursive, then it
-                    // will report the error, so we don't have to.
-                    self.found_recursion = def_id == self.primary_def_id;
-                    None
-                }
-            }
-        }
-
-        impl<'tcx> TypeFolder<'tcx> for OpaqueTypeExpander<'tcx> {
-            fn tcx(&self) -> TyCtxt<'tcx> {
-                self.tcx
-            }
-
-            fn fold_ty(&mut self, t: Ty<'tcx>) -> Ty<'tcx> {
-                if let ty::Opaque(def_id, substs) = t.kind {
-                    self.expand_opaque_ty(def_id, substs).unwrap_or(t)
-                } else if t.has_opaque_types() {
-                    t.super_fold_with(self)
-                } else {
-                    t
-                }
-            }
-        }
-
         let mut visitor = OpaqueTypeExpander {
             seen_opaque_tys: FxHashSet::default(),
             expanded_cache: FxHashMap::default(),
-            primary_def_id: def_id,
+            primary_def_id: Some(def_id),
             found_recursion: false,
+            check_recursion: true,
             tcx: self,
         };
+
         let expanded_type = visitor.expand_opaque_ty(def_id, substs).unwrap();
         if visitor.found_recursion { Err(expanded_type) } else { Ok(expanded_type) }
+    }
+}
+
+struct OpaqueTypeExpander<'tcx> {
+    // Contains the DefIds of the opaque types that are currently being
+    // expanded. When we expand an opaque type we insert the DefId of
+    // that type, and when we finish expanding that type we remove the
+    // its DefId.
+    seen_opaque_tys: FxHashSet<DefId>,
+    // Cache of all expansions we've seen so far. This is a critical
+    // optimization for some large types produced by async fn trees.
+    expanded_cache: FxHashMap<(DefId, SubstsRef<'tcx>), Ty<'tcx>>,
+    primary_def_id: Option<DefId>,
+    found_recursion: bool,
+    /// Whether or not to check for recursive opaque types.
+    /// This is `true` when we're explicitly checking for opaque type
+    /// recursion, and 'false' otherwise to avoid unnecessary work.
+    check_recursion: bool,
+    tcx: TyCtxt<'tcx>,
+}
+
+impl<'tcx> OpaqueTypeExpander<'tcx> {
+    fn expand_opaque_ty(&mut self, def_id: DefId, substs: SubstsRef<'tcx>) -> Option<Ty<'tcx>> {
+        if self.found_recursion {
+            return None;
+        }
+        let substs = substs.fold_with(self);
+        if !self.check_recursion || self.seen_opaque_tys.insert(def_id) {
+            let expanded_ty = match self.expanded_cache.get(&(def_id, substs)) {
+                Some(expanded_ty) => expanded_ty,
+                None => {
+                    let generic_ty = self.tcx.type_of(def_id);
+                    let concrete_ty = generic_ty.subst(self.tcx, substs);
+                    let expanded_ty = self.fold_ty(concrete_ty);
+                    self.expanded_cache.insert((def_id, substs), expanded_ty);
+                    expanded_ty
+                }
+            };
+            if self.check_recursion {
+                self.seen_opaque_tys.remove(&def_id);
+            }
+            Some(expanded_ty)
+        } else {
+            // If another opaque type that we contain is recursive, then it
+            // will report the error, so we don't have to.
+            self.found_recursion = def_id == *self.primary_def_id.as_ref().unwrap();
+            None
+        }
+    }
+}
+
+impl<'tcx> TypeFolder<'tcx> for OpaqueTypeExpander<'tcx> {
+    fn tcx(&self) -> TyCtxt<'tcx> {
+        self.tcx
+    }
+
+    fn fold_ty(&mut self, t: Ty<'tcx>) -> Ty<'tcx> {
+        if let ty::Opaque(def_id, substs) = t.kind {
+            self.expand_opaque_ty(def_id, substs).unwrap_or(t)
+        } else if t.has_opaque_types() {
+            t.super_fold_with(self)
+        } else {
+            t
+        }
     }
 }
 
@@ -678,11 +684,10 @@ impl<'tcx> ty::TyS<'tcx> {
     /// winds up being reported as an error during NLL borrow check.
     pub fn is_copy_modulo_regions(
         &'tcx self,
-        tcx: TyCtxt<'tcx>,
+        tcx_at: TyCtxtAt<'tcx>,
         param_env: ty::ParamEnv<'tcx>,
-        span: Span,
     ) -> bool {
-        tcx.at(span).is_copy_raw(param_env.and(self))
+        tcx_at.is_copy_raw(param_env.and(self))
     }
 
     /// Checks whether values of this type `T` have a size known at
@@ -702,13 +707,9 @@ impl<'tcx> ty::TyS<'tcx> {
     /// optimization as well as the rules around static values. Note
     /// that the `Freeze` trait is not exposed to end users and is
     /// effectively an implementation detail.
-    pub fn is_freeze(
-        &'tcx self,
-        tcx: TyCtxt<'tcx>,
-        param_env: ty::ParamEnv<'tcx>,
-        span: Span,
-    ) -> bool {
-        self.is_trivially_freeze() || tcx.at(span).is_freeze_raw(param_env.and(self))
+    // FIXME: use `TyCtxtAt` instead of separate `Span`.
+    pub fn is_freeze(&'tcx self, tcx_at: TyCtxtAt<'tcx>, param_env: ty::ParamEnv<'tcx>) -> bool {
+        self.is_trivially_freeze() || tcx_at.is_freeze_raw(param_env.and(self))
     }
 
     /// Fast path helper for testing if a type is `Freeze`.
@@ -727,7 +728,7 @@ impl<'tcx> ty::TyS<'tcx> {
             | ty::Ref(..)
             | ty::RawPtr(_)
             | ty::FnDef(..)
-            | ty::Error
+            | ty::Error(_)
             | ty::FnPtr(_) => true,
             ty::Tuple(_) => self.tuple_fields().all(Self::is_trivially_freeze),
             ty::Slice(elem_ty) | ty::Array(elem_ty, _) => elem_ty.is_trivially_freeze(),
@@ -742,8 +743,7 @@ impl<'tcx> ty::TyS<'tcx> {
             | ty::Opaque(..)
             | ty::Param(_)
             | ty::Placeholder(_)
-            | ty::Projection(_)
-            | ty::UnnormalizedProjection(_) => false,
+            | ty::Projection(_) => false,
         }
     }
 
@@ -773,6 +773,57 @@ impl<'tcx> ty::TyS<'tcx> {
                 let erased = tcx.normalize_erasing_regions(param_env, query_ty);
                 tcx.needs_drop_raw(param_env.and(erased))
             }
+        }
+    }
+
+    /// Returns `true` if equality for this type is both reflexive and structural.
+    ///
+    /// Reflexive equality for a type is indicated by an `Eq` impl for that type.
+    ///
+    /// Primitive types (`u32`, `str`) have structural equality by definition. For composite data
+    /// types, equality for the type as a whole is structural when it is the same as equality
+    /// between all components (fields, array elements, etc.) of that type. For ADTs, structural
+    /// equality is indicated by an implementation of `PartialStructuralEq` and `StructuralEq` for
+    /// that type.
+    ///
+    /// This function is "shallow" because it may return `true` for a composite type whose fields
+    /// are not `StructuralEq`. For example, `[T; 4]` has structural equality regardless of `T`
+    /// because equality for arrays is determined by the equality of each array element. If you
+    /// want to know whether a given call to `PartialEq::eq` will proceed structurally all the way
+    /// down, you will need to use a type visitor.
+    #[inline]
+    pub fn is_structural_eq_shallow(&'tcx self, tcx: TyCtxt<'tcx>) -> bool {
+        match self.kind {
+            // Look for an impl of both `PartialStructuralEq` and `StructuralEq`.
+            Adt(..) => tcx.has_structural_eq_impls(self),
+
+            // Primitive types that satisfy `Eq`.
+            Bool | Char | Int(_) | Uint(_) | Str | Never => true,
+
+            // Composite types that satisfy `Eq` when all of their fields do.
+            //
+            // Because this function is "shallow", we return `true` for these composites regardless
+            // of the type(s) contained within.
+            Ref(..) | Array(..) | Slice(_) | Tuple(..) => true,
+
+            // Raw pointers use bitwise comparison.
+            RawPtr(_) | FnPtr(_) => true,
+
+            // Floating point numbers are not `Eq`.
+            Float(_) => false,
+
+            // Conservatively return `false` for all others...
+
+            // Anonymous function types
+            FnDef(..) | Closure(..) | Dynamic(..) | Generator(..) => false,
+
+            // Generic or inferred types
+            //
+            // FIXME(ecstaticmorse): Maybe we should `bug` here? This should probably only be
+            // called for known, fully-monomorphized types.
+            Projection(_) | Opaque(..) | Param(_) | Bound(..) | Placeholder(_) | Infer(_) => false,
+
+            Foreign(_) | GeneratorWitness(..) | Error(_) => false,
         }
     }
 
@@ -825,7 +876,15 @@ impl<'tcx> ty::TyS<'tcx> {
                     // Find non representable fields with their spans
                     fold_repr(def.all_fields().map(|field| {
                         let ty = field.ty(tcx, substs);
-                        let span = tcx.hir().span_if_local(field.did).unwrap_or(sp);
+                        let span = match field
+                            .did
+                            .as_local()
+                            .map(|id| tcx.hir().local_def_id_to_hir_id(id))
+                            .and_then(|id| tcx.hir().find(id))
+                        {
+                            Some(hir::Node::Field(field)) => field.ty.span,
+                            _ => sp,
+                        };
                         match is_type_structurally_recursive(
                             tcx,
                             span,
@@ -1047,10 +1106,7 @@ pub fn needs_drop_components(
         // Foreign types can never have destructors.
         ty::Foreign(..) => Ok(SmallVec::new()),
 
-        // Pessimistically assume that all generators will require destructors
-        // as we don't know if a destructor is a noop or not until after the MIR
-        // state transformation pass.
-        ty::Generator(..) | ty::Dynamic(..) | ty::Error => Err(AlwaysRequiresDrop),
+        ty::Dynamic(..) | ty::Error(_) => Err(AlwaysRequiresDrop),
 
         ty::Slice(ty) => needs_drop_components(ty, target_layout),
         ty::Array(elem_ty, size) => {
@@ -1077,15 +1133,36 @@ pub fn needs_drop_components(
         // These require checking for `Copy` bounds or `Adt` destructors.
         ty::Adt(..)
         | ty::Projection(..)
-        | ty::UnnormalizedProjection(..)
         | ty::Param(_)
         | ty::Bound(..)
         | ty::Placeholder(..)
         | ty::Opaque(..)
         | ty::Infer(_)
-        | ty::Closure(..) => Ok(smallvec![ty]),
+        | ty::Closure(..)
+        | ty::Generator(..) => Ok(smallvec![ty]),
     }
 }
 
-#[derive(Copy, Clone, Debug, HashStable, RustcEncodable, RustcDecodable)]
+#[derive(Copy, Clone, Debug, HashStable, TyEncodable, TyDecodable)]
 pub struct AlwaysRequiresDrop;
+
+/// Normalizes all opaque types in the given value, replacing them
+/// with their underlying types.
+pub fn normalize_opaque_types(
+    tcx: TyCtxt<'tcx>,
+    val: &'tcx List<ty::Predicate<'tcx>>,
+) -> &'tcx List<ty::Predicate<'tcx>> {
+    let mut visitor = OpaqueTypeExpander {
+        seen_opaque_tys: FxHashSet::default(),
+        expanded_cache: FxHashMap::default(),
+        primary_def_id: None,
+        found_recursion: false,
+        check_recursion: false,
+        tcx,
+    };
+    val.fold_with(&mut visitor)
+}
+
+pub fn provide(providers: &mut ty::query::Providers) {
+    *providers = ty::query::Providers { normalize_opaque_types, ..*providers }
+}

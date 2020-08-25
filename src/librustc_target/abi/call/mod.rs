@@ -5,6 +5,7 @@ use crate::spec::{self, HasTargetSpec};
 mod aarch64;
 mod amdgpu;
 mod arm;
+mod avr;
 mod hexagon;
 mod mips;
 mod mips64;
@@ -308,13 +309,16 @@ impl<'a, Ty> TyAndLayout<'a, Ty> {
             }
 
             Abi::ScalarPair(..) | Abi::Aggregate { .. } => {
-                // Helper for computing `homogenous_aggregate`, allowing a custom
+                // Helper for computing `homogeneous_aggregate`, allowing a custom
                 // starting offset (used below for handling variants).
                 let from_fields_at =
                     |layout: Self,
                      start: Size|
                      -> Result<(HomogeneousAggregate, Size), Heterogeneous> {
                         let is_union = match layout.fields {
+                            FieldsShape::Primitive => {
+                                unreachable!("aggregates can't have `FieldsShape::Primitive`")
+                            }
                             FieldsShape::Array { count, .. } => {
                                 assert_eq!(start, Size::ZERO);
 
@@ -522,6 +526,8 @@ pub enum Conv {
     X86_64Win64,
 
     AmdGpuKernel,
+    AvrInterrupt,
+    AvrNonBlockingInterrupt,
 }
 
 /// Metadata describing how the arguments to a native function
@@ -577,6 +583,7 @@ impl<'a, Ty> FnAbi<'a, Ty> {
             "aarch64" => aarch64::compute_abi_info(cx, self),
             "amdgpu" => amdgpu::compute_abi_info(cx, self),
             "arm" => arm::compute_abi_info(cx, self),
+            "avr" => avr::compute_abi_info(self),
             "mips" => mips::compute_abi_info(cx, self),
             "mips64" => mips64::compute_abi_info(cx, self),
             "powerpc" => powerpc::compute_abi_info(self),

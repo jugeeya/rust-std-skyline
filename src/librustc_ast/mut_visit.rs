@@ -11,10 +11,11 @@ use crate::ast::*;
 use crate::ptr::P;
 use crate::token::{self, Token};
 use crate::tokenstream::*;
-use crate::util::map_in_place::MapInPlace;
 
+use rustc_data_structures::map_in_place::MapInPlace;
 use rustc_data_structures::sync::Lrc;
 use rustc_span::source_map::{respan, Spanned};
+use rustc_span::symbol::Ident;
 use rustc_span::Span;
 
 use smallvec::{smallvec, Array, SmallVec};
@@ -362,9 +363,10 @@ pub fn visit_bounds<T: MutVisitor>(bounds: &mut GenericBounds, vis: &mut T) {
 }
 
 // No `noop_` prefix because there isn't a corresponding method in `MutVisitor`.
-pub fn visit_fn_sig<T: MutVisitor>(FnSig { header, decl }: &mut FnSig, vis: &mut T) {
+pub fn visit_fn_sig<T: MutVisitor>(FnSig { header, decl, span }: &mut FnSig, vis: &mut T) {
     vis.visit_fn_header(header);
     vis.visit_fn_decl(decl);
+    vis.visit_span(span);
 }
 
 // No `noop_` prefix because there isn't a corresponding method in `MutVisitor`.
@@ -581,7 +583,7 @@ pub fn noop_visit_attribute<T: MutVisitor>(attr: &mut Attribute, vis: &mut T) {
             vis.visit_path(path);
             visit_mac_args(args, vis);
         }
-        AttrKind::DocComment(_) => {}
+        AttrKind::DocComment(..) => {}
     }
     vis.visit_span(span);
 }
@@ -761,7 +763,7 @@ pub fn noop_flat_map_generic_param<T: MutVisitor>(
         GenericParamKind::Type { default } => {
             visit_opt(default, |default| vis.visit_ty(default));
         }
-        GenericParamKind::Const { ty } => {
+        GenericParamKind::Const { ty, kw_span: _ } => {
             vis.visit_ty(ty);
         }
     }
@@ -785,7 +787,7 @@ pub fn noop_visit_generics<T: MutVisitor>(generics: &mut Generics, vis: &mut T) 
 }
 
 pub fn noop_visit_where_clause<T: MutVisitor>(wc: &mut WhereClause, vis: &mut T) {
-    let WhereClause { predicates, span } = wc;
+    let WhereClause { has_where_token: _, predicates, span } = wc;
     visit_vec(predicates, |predicate| vis.visit_where_predicate(predicate));
     vis.visit_span(span);
 }
@@ -1052,7 +1054,7 @@ pub fn noop_flat_map_foreign_item<T: MutVisitor>(
 }
 
 pub fn noop_visit_pat<T: MutVisitor>(pat: &mut P<Pat>, vis: &mut T) {
-    let Pat { id, kind, span } = pat.deref_mut();
+    let Pat { id, kind, span, tokens: _ } = pat.deref_mut();
     vis.visit_id(id);
     match kind {
         PatKind::Wild | PatKind::Rest => {}
@@ -1094,7 +1096,10 @@ pub fn noop_visit_anon_const<T: MutVisitor>(AnonConst { id, value }: &mut AnonCo
     vis.visit_expr(value);
 }
 
-pub fn noop_visit_expr<T: MutVisitor>(Expr { kind, id, span, attrs }: &mut Expr, vis: &mut T) {
+pub fn noop_visit_expr<T: MutVisitor>(
+    Expr { kind, id, span, attrs, tokens: _ }: &mut Expr,
+    vis: &mut T,
+) {
     match kind {
         ExprKind::Box(expr) => vis.visit_expr(expr),
         ExprKind::Array(exprs) => visit_exprs(exprs, vis),
@@ -1107,11 +1112,12 @@ pub fn noop_visit_expr<T: MutVisitor>(Expr { kind, id, span, attrs }: &mut Expr,
             vis.visit_expr(f);
             visit_exprs(args, vis);
         }
-        ExprKind::MethodCall(PathSegment { ident, id, args }, exprs) => {
+        ExprKind::MethodCall(PathSegment { ident, id, args }, exprs, span) => {
             vis.visit_ident(ident);
             vis.visit_id(id);
             visit_opt(args, |args| vis.visit_generic_args(args));
             visit_exprs(exprs, vis);
+            vis.visit_span(span);
         }
         ExprKind::Binary(_binop, lhs, rhs) => {
             vis.visit_expr(lhs);
@@ -1203,6 +1209,27 @@ pub fn noop_visit_expr<T: MutVisitor>(Expr { kind, id, span, attrs }: &mut Expr,
         }
         ExprKind::Ret(expr) => {
             visit_opt(expr, |expr| vis.visit_expr(expr));
+        }
+        ExprKind::InlineAsm(asm) => {
+            for (op, _) in &mut asm.operands {
+                match op {
+                    InlineAsmOperand::In { expr, .. }
+                    | InlineAsmOperand::InOut { expr, .. }
+                    | InlineAsmOperand::Const { expr, .. }
+                    | InlineAsmOperand::Sym { expr, .. } => vis.visit_expr(expr),
+                    InlineAsmOperand::Out { expr, .. } => {
+                        if let Some(expr) = expr {
+                            vis.visit_expr(expr);
+                        }
+                    }
+                    InlineAsmOperand::SplitInOut { in_expr, out_expr, .. } => {
+                        vis.visit_expr(in_expr);
+                        if let Some(out_expr) = out_expr {
+                            vis.visit_expr(out_expr);
+                        }
+                    }
+                }
+            }
         }
         ExprKind::LlvmInlineAsm(asm) => {
             let LlvmInlineAsm {

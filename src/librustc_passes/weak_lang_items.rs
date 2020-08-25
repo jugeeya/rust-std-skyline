@@ -4,11 +4,11 @@ use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::struct_span_err;
 use rustc_hir as hir;
 use rustc_hir::intravisit::{self, NestedVisitorMap, Visitor};
-use rustc_hir::lang_items;
+use rustc_hir::lang_items::{self, LangItem};
 use rustc_hir::weak_lang_items::WEAK_ITEMS_REFS;
-use rustc_middle::middle::lang_items::whitelisted;
+use rustc_middle::middle::lang_items::required;
 use rustc_middle::ty::TyCtxt;
-use rustc_session::config;
+use rustc_session::config::CrateType;
 use rustc_span::symbol::Symbol;
 use rustc_span::Span;
 
@@ -24,7 +24,7 @@ pub fn check_crate<'tcx>(tcx: TyCtxt<'tcx>, items: &mut lang_items::LanguageItem
     // They will never implicitly be added to the `missing` array unless we do
     // so here.
     if items.eh_personality().is_none() {
-        items.missing.push(lang_items::EhPersonalityLangItem);
+        items.missing.push(LangItem::EhPersonality);
     }
 
     {
@@ -37,13 +37,13 @@ pub fn check_crate<'tcx>(tcx: TyCtxt<'tcx>, items: &mut lang_items::LanguageItem
 fn verify<'tcx>(tcx: TyCtxt<'tcx>, items: &lang_items::LanguageItems) {
     // We only need to check for the presence of weak lang items if we're
     // emitting something that's not an rlib.
-    let needs_check = tcx.sess.crate_types.borrow().iter().any(|kind| match *kind {
-        config::CrateType::Dylib
-        | config::CrateType::ProcMacro
-        | config::CrateType::Cdylib
-        | config::CrateType::Executable
-        | config::CrateType::Staticlib => true,
-        config::CrateType::Rlib => false,
+    let needs_check = tcx.sess.crate_types().iter().any(|kind| match *kind {
+        CrateType::Dylib
+        | CrateType::ProcMacro
+        | CrateType::Cdylib
+        | CrateType::Executable
+        | CrateType::Staticlib => true,
+        CrateType::Rlib => false,
     });
     if !needs_check {
         return;
@@ -57,10 +57,10 @@ fn verify<'tcx>(tcx: TyCtxt<'tcx>, items: &lang_items::LanguageItems) {
     }
 
     for (name, &item) in WEAK_ITEMS_REFS.iter() {
-        if missing.contains(&item) && !whitelisted(tcx, item) && items.require(item).is_err() {
-            if item == lang_items::PanicImplLangItem {
+        if missing.contains(&item) && required(tcx, item) && items.require(item).is_err() {
+            if item == LangItem::PanicImpl {
                 tcx.sess.err("`#[panic_handler]` function required, but not found");
-            } else if item == lang_items::OomLangItem {
+            } else if item == LangItem::Oom {
                 tcx.sess.err("`#[alloc_error_handler]` function required, but not found");
             } else {
                 tcx.sess.err(&format!("language item required, but not found: `{}`", name));
@@ -90,7 +90,8 @@ impl<'a, 'tcx, 'v> Visitor<'v> for Context<'a, 'tcx> {
     }
 
     fn visit_foreign_item(&mut self, i: &hir::ForeignItem<'_>) {
-        if let Some((lang_item, _)) = hir::lang_items::extract(&i.attrs) {
+        let check_name = |attr, sym| self.tcx.sess.check_name(attr, sym);
+        if let Some((lang_item, _)) = lang_items::extract(check_name, &i.attrs) {
             self.register(lang_item, i.span);
         }
         intravisit::walk_foreign_item(self, i)

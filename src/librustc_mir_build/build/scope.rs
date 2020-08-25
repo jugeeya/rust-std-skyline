@@ -1,6 +1,6 @@
 /*!
 Managing the scope stack. The scopes are tied to lexical scopes, so as
-we descend the HAIR, we push a scope on the stack, build its
+we descend the THIR, we push a scope on the stack, build its
 contents, and then pop it off. Every scope is named by a
 `region::Scope`.
 
@@ -83,12 +83,12 @@ should go to.
 */
 
 use crate::build::{BlockAnd, BlockAndExtension, BlockFrame, Builder, CFG};
-use crate::hair::{Expr, ExprRef, LintLevel};
-use rustc_middle::middle::region;
-use rustc_middle::mir::*;
+use crate::thir::{Expr, ExprRef, LintLevel};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir as hir;
 use rustc_hir::GeneratorKind;
+use rustc_middle::middle::region;
+use rustc_middle::mir::*;
 use rustc_span::{Span, DUMMY_SP};
 use std::collections::hash_map::Entry;
 use std::mem;
@@ -523,7 +523,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 unpack!(block = self.into(destination, block, value));
                 self.block_context.pop();
             } else {
-                self.cfg.push_assign_unit(block, source_info, destination)
+                self.cfg.push_assign_unit(block, source_info, destination, self.hir.tcx())
             }
         } else {
             assert!(value.is_none(), "`return` and `break` should have a destination");
@@ -989,7 +989,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             let resumeblk = self.cfg.start_new_cleanup_block();
             self.cfg.terminate(
                 resumeblk,
-                SourceInfo { scope: OUTERMOST_SOURCE_SCOPE, span: self.fn_span },
+                SourceInfo::outermost(self.fn_span),
                 TerminatorKind::Resume,
             );
             self.cached_resume_block = Some(resumeblk);
@@ -1037,7 +1037,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         &mut self,
         block: BasicBlock,
         span: Span,
-        location: Place<'tcx>,
+        place: Place<'tcx>,
         value: Operand<'tcx>,
     ) -> BlockAnd<()> {
         let source_info = self.source_info(span);
@@ -1047,7 +1047,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             block,
             source_info,
             TerminatorKind::DropAndReplace {
-                location,
+                place,
                 value,
                 target: next_target,
                 unwind: Some(diverge_target),
@@ -1158,7 +1158,7 @@ fn build_scope_drops<'tcx>(
                     block,
                     source_info,
                     TerminatorKind::Drop {
-                        location: local.into(),
+                        place: local.into(),
                         target: next,
                         unwind: Some(unwind_to),
                     },
@@ -1272,7 +1272,7 @@ fn build_diverge_scope<'tcx>(
                         block,
                         source_info(drop_data.span),
                         TerminatorKind::Drop {
-                            location: drop_data.local.into(),
+                            place: drop_data.local.into(),
                             target,
                             unwind: None,
                         },

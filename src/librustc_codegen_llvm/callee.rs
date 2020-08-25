@@ -9,11 +9,11 @@ use crate::attributes;
 use crate::context::CodegenCx;
 use crate::llvm;
 use crate::value::Value;
-use log::debug;
 use rustc_codegen_ssa::traits::*;
+use tracing::debug;
 
 use rustc_middle::ty::layout::{FnAbiExt, HasTyCtxt};
-use rustc_middle::ty::{Instance, TypeFoldable};
+use rustc_middle::ty::{self, Instance, TypeFoldable};
 
 /// Codegens a reference to a fn/method item, monomorphizing and
 /// inlining as it goes.
@@ -29,14 +29,18 @@ pub fn get_fn(cx: &CodegenCx<'ll, 'tcx>, instance: Instance<'tcx>) -> &'ll Value
 
     assert!(!instance.substs.needs_infer());
     assert!(!instance.substs.has_escaping_bound_vars());
-    assert!(!instance.substs.has_param_types_or_consts());
 
     if let Some(&llfn) = cx.instances.borrow().get(&instance) {
         return llfn;
     }
 
-    let sym = tcx.symbol_name(instance).name.as_str();
-    debug!("get_fn({:?}: {:?}) => {}", instance, instance.monomorphic_ty(cx.tcx()), sym);
+    let sym = tcx.symbol_name(instance).name;
+    debug!(
+        "get_fn({:?}: {:?}) => {}",
+        instance,
+        instance.ty(cx.tcx(), ty::ParamEnv::reveal_all()),
+        sym
+    );
 
     let fn_abi = FnAbi::of_instance(cx, instance, &[]);
 
@@ -116,7 +120,7 @@ pub fn get_fn(cx: &CodegenCx<'ll, 'tcx>, instance: Instance<'tcx>) -> &'ll Value
                 if cx.tcx.sess.opts.share_generics() {
                     // We are in share_generics mode.
 
-                    if instance_def_id.is_local() {
+                    if let Some(instance_def_id) = instance_def_id.as_local() {
                         // This is a definition from the current crate. If the
                         // definition is unreachable for downstream crates or
                         // the current crate does not re-export generics, the
@@ -168,7 +172,12 @@ pub fn get_fn(cx: &CodegenCx<'ll, 'tcx>, instance: Instance<'tcx>) -> &'ll Value
             }
         }
 
-        if cx.use_dll_storage_attrs && tcx.is_dllimport_foreign_item(instance_def_id) {
+        // MinGW: For backward compatibility we rely on the linker to decide whether it
+        // should use dllimport for functions.
+        if cx.use_dll_storage_attrs
+            && tcx.is_dllimport_foreign_item(instance_def_id)
+            && tcx.sess.target.target.target_env != "gnu"
+        {
             unsafe {
                 llvm::LLVMSetDLLStorageClass(llfn, llvm::DLLStorageClass::DllImport);
             }

@@ -1,8 +1,8 @@
 use rustc_data_structures::graph::dominators::Dominators;
 use rustc_middle::mir::visit::Visitor;
-use rustc_middle::mir::TerminatorKind;
-use rustc_middle::mir::{BasicBlock, Body, Location, Place, ReadOnlyBodyAndCache, Rvalue};
+use rustc_middle::mir::{BasicBlock, Body, Location, Place, Rvalue};
 use rustc_middle::mir::{BorrowKind, Mutability, Operand};
+use rustc_middle::mir::{InlineAsmOperand, Terminator, TerminatorKind};
 use rustc_middle::mir::{Statement, StatementKind};
 use rustc_middle::ty::TyCtxt;
 
@@ -18,7 +18,7 @@ pub(super) fn generate_invalidates<'tcx>(
     tcx: TyCtxt<'tcx>,
     all_facts: &mut Option<AllFacts>,
     location_table: &LocationTable,
-    body: ReadOnlyBodyAndCache<'_, 'tcx>,
+    body: &Body<'tcx>,
     borrow_set: &BorrowSet<'tcx>,
 ) {
     if all_facts.is_none() {
@@ -37,7 +37,7 @@ pub(super) fn generate_invalidates<'tcx>(
             body: &body,
             dominators,
         };
-        ig.visit_body(&body);
+        ig.visit_body(body);
     }
 }
 
@@ -93,6 +93,7 @@ impl<'cx, 'tcx> Visitor<'tcx> for InvalidationGenerator<'cx, 'tcx> {
                 }
             }
             StatementKind::Nop
+            | StatementKind::Coverage(..)
             | StatementKind::AscribeUserType(..)
             | StatementKind::Retag { .. }
             | StatementKind::StorageLive(..) => {
@@ -112,14 +113,14 @@ impl<'cx, 'tcx> Visitor<'tcx> for InvalidationGenerator<'cx, 'tcx> {
         self.super_statement(statement, location);
     }
 
-    fn visit_terminator_kind(&mut self, kind: &TerminatorKind<'tcx>, location: Location) {
+    fn visit_terminator(&mut self, terminator: &Terminator<'tcx>, location: Location) {
         self.check_activations(location);
 
-        match kind {
+        match &terminator.kind {
             TerminatorKind::SwitchInt { ref discr, switch_ty: _, values: _, targets: _ } => {
                 self.consume_operand(location, discr);
             }
-            TerminatorKind::Drop { location: drop_place, target: _, unwind: _ } => {
+            TerminatorKind::Drop { place: drop_place, target: _, unwind: _ } => {
                 self.access_place(
                     location,
                     *drop_place,
@@ -128,7 +129,7 @@ impl<'cx, 'tcx> Visitor<'tcx> for InvalidationGenerator<'cx, 'tcx> {
                 );
             }
             TerminatorKind::DropAndReplace {
-                location: drop_place,
+                place: drop_place,
                 value: ref new_value,
                 target: _,
                 unwind: _,
@@ -142,6 +143,7 @@ impl<'cx, 'tcx> Visitor<'tcx> for InvalidationGenerator<'cx, 'tcx> {
                 destination,
                 cleanup: _,
                 from_hir_call: _,
+                fn_span: _,
             } => {
                 self.consume_operand(location, func);
                 for arg in args {
@@ -165,8 +167,8 @@ impl<'cx, 'tcx> Visitor<'tcx> for InvalidationGenerator<'cx, 'tcx> {
                 // Invalidate all borrows of local places
                 let borrow_set = self.borrow_set.clone();
                 let resume = self.location_table.start_index(resume.start_location());
-                for i in borrow_set.borrows.indices() {
-                    if borrow_of_local_data(borrow_set.borrows[i].borrowed_place) {
+                for (i, data) in borrow_set.iter_enumerated() {
+                    if borrow_of_local_data(data.borrowed_place) {
                         self.all_facts.invalidates.push((resume, i));
                     }
                 }
@@ -177,22 +179,51 @@ impl<'cx, 'tcx> Visitor<'tcx> for InvalidationGenerator<'cx, 'tcx> {
                 // Invalidate all borrows of local places
                 let borrow_set = self.borrow_set.clone();
                 let start = self.location_table.start_index(location);
-                for i in borrow_set.borrows.indices() {
-                    if borrow_of_local_data(borrow_set.borrows[i].borrowed_place) {
+                for (i, data) in borrow_set.iter_enumerated() {
+                    if borrow_of_local_data(data.borrowed_place) {
                         self.all_facts.invalidates.push((start, i));
+                    }
+                }
+            }
+            TerminatorKind::InlineAsm {
+                template: _,
+                ref operands,
+                options: _,
+                line_spans: _,
+                destination: _,
+            } => {
+                for op in operands {
+                    match *op {
+                        InlineAsmOperand::In { reg: _, ref value }
+                        | InlineAsmOperand::Const { ref value } => {
+                            self.consume_operand(location, value);
+                        }
+                        InlineAsmOperand::Out { reg: _, late: _, place, .. } => {
+                            if let Some(place) = place {
+                                self.mutate_place(location, place, Shallow(None), JustWrite);
+                            }
+                        }
+                        InlineAsmOperand::InOut { reg: _, late: _, ref in_value, out_place } => {
+                            self.consume_operand(location, in_value);
+                            if let Some(out_place) = out_place {
+                                self.mutate_place(location, out_place, Shallow(None), JustWrite);
+                            }
+                        }
+                        InlineAsmOperand::SymFn { value: _ }
+                        | InlineAsmOperand::SymStatic { def_id: _ } => {}
                     }
                 }
             }
             TerminatorKind::Goto { target: _ }
             | TerminatorKind::Abort
             | TerminatorKind::Unreachable
-            | TerminatorKind::FalseEdges { real_target: _, imaginary_target: _ }
+            | TerminatorKind::FalseEdge { real_target: _, imaginary_target: _ }
             | TerminatorKind::FalseUnwind { real_target: _, unwind: _ } => {
                 // no data used, thus irrelevant to borrowck
             }
         }
 
-        self.super_terminator_kind(kind, location);
+        self.super_terminator(terminator, location);
     }
 }
 
@@ -272,6 +303,8 @@ impl<'cx, 'tcx> InvalidationGenerator<'cx, 'tcx> {
                 self.access_place(location, place, access_kind, LocalMutationIsAllowed::No);
             }
 
+            Rvalue::ThreadLocalRef(_) => {}
+
             Rvalue::Use(ref operand)
             | Rvalue::Repeat(ref operand, _)
             | Rvalue::UnaryOp(_ /*un_op*/, ref operand)
@@ -337,7 +370,7 @@ impl<'cx, 'tcx> InvalidationGenerator<'cx, 'tcx> {
         let tcx = self.tcx;
         let body = self.body;
         let borrow_set = self.borrow_set.clone();
-        let indices = self.borrow_set.borrows.indices();
+        let indices = self.borrow_set.indices();
         each_borrow_involving_path(
             self,
             tcx,
@@ -359,14 +392,15 @@ impl<'cx, 'tcx> InvalidationGenerator<'cx, 'tcx> {
                         // have already taken the reservation
                     }
 
-                    (Read(_), BorrowKind::Shallow)
-                    | (Read(_), BorrowKind::Shared)
-                    | (Read(ReadKind::Borrow(BorrowKind::Shallow)), BorrowKind::Unique)
-                    | (Read(ReadKind::Borrow(BorrowKind::Shallow)), BorrowKind::Mut { .. }) => {
+                    (Read(_), BorrowKind::Shallow | BorrowKind::Shared)
+                    | (
+                        Read(ReadKind::Borrow(BorrowKind::Shallow)),
+                        BorrowKind::Unique | BorrowKind::Mut { .. },
+                    ) => {
                         // Reads don't invalidate shared or shallow borrows
                     }
 
-                    (Read(_), BorrowKind::Unique) | (Read(_), BorrowKind::Mut { .. }) => {
+                    (Read(_), BorrowKind::Unique | BorrowKind::Mut { .. }) => {
                         // Reading from mere reservations of mutable-borrows is OK.
                         if !is_active(&this.dominators, borrow, location) {
                             // If the borrow isn't active yet, reads don't invalidate it
@@ -379,7 +413,7 @@ impl<'cx, 'tcx> InvalidationGenerator<'cx, 'tcx> {
                         this.generate_invalidates(borrow_index, location);
                     }
 
-                    (Reservation(_), _) | (Activation(_, _), _) | (Write(_), _) => {
+                    (Reservation(_) | Activation(_, _) | Write(_), _) => {
                         // unique or mutable borrows are invalidated by writes.
                         // Reservations count as writes since we need to check
                         // that activating the borrow will be OK

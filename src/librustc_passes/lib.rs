@@ -7,12 +7,13 @@
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/")]
 #![feature(in_band_lifetimes)]
 #![feature(nll)]
+#![feature(or_patterns)]
 #![recursion_limit = "256"]
 
 #[macro_use]
 extern crate rustc_middle;
 #[macro_use]
-extern crate log;
+extern crate tracing;
 
 use rustc_middle::ty::query::Providers;
 
@@ -35,7 +36,7 @@ pub mod stability;
 mod upvars;
 mod weak_lang_items;
 
-pub fn provide(providers: &mut Providers<'_>) {
+pub fn provide(providers: &mut Providers) {
     check_attr::provide(providers);
     check_const::provide(providers);
     diagnostic_items::provide(providers);

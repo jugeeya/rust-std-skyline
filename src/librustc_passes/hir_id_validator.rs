@@ -79,7 +79,7 @@ impl<'a, 'hir> HirIdValidator<'a, 'hir> {
 
     fn check<F: FnOnce(&mut HirIdValidator<'a, 'hir>)>(&mut self, hir_id: HirId, walk: F) {
         assert!(self.owner.is_none());
-        let owner = self.hir_map.local_def_id(hir_id).expect_local();
+        let owner = self.hir_map.local_def_id(hir_id);
         self.owner = Some(owner);
         walk(self);
 
@@ -142,16 +142,6 @@ impl<'a, 'hir> intravisit::Visitor<'hir> for HirIdValidator<'a, 'hir> {
 
     fn visit_id(&mut self, hir_id: HirId) {
         let owner = self.owner.expect("no owner");
-
-        if hir_id == hir::DUMMY_HIR_ID {
-            self.error(|| {
-                format!(
-                    "HirIdValidator: HirId {:?} is invalid",
-                    self.hir_map.node_to_string(hir_id)
-                )
-            });
-            return;
-        }
 
         if owner != hir_id.owner {
             self.error(|| {

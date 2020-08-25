@@ -6,35 +6,24 @@ use self::EvaluationResult::*;
 
 use super::{SelectionError, SelectionResult};
 
-use crate::dep_graph::DepNodeIndex;
-use crate::ty::{self, TyCtxt};
+use crate::ty;
 
-use rustc_data_structures::fx::FxHashMap;
-use rustc_data_structures::sync::Lock;
 use rustc_hir::def_id::DefId;
+use rustc_query_system::cache::Cache;
 
-#[derive(Clone, Default)]
-pub struct SelectionCache<'tcx> {
-    pub hashmap: Lock<
-        FxHashMap<
-            ty::ParamEnvAnd<'tcx, ty::TraitRef<'tcx>>,
-            WithDepNode<SelectionResult<'tcx, SelectionCandidate<'tcx>>>,
-        >,
-    >,
-}
+pub type SelectionCache<'tcx> = Cache<
+    ty::ParamEnvAnd<'tcx, ty::TraitRef<'tcx>>,
+    SelectionResult<'tcx, SelectionCandidate<'tcx>>,
+>;
 
-impl<'tcx> SelectionCache<'tcx> {
-    /// Actually frees the underlying memory in contrast to what stdlib containers do on `clear`
-    pub fn clear(&self) {
-        *self.hashmap.borrow_mut() = Default::default();
-    }
-}
+pub type EvaluationCache<'tcx> =
+    Cache<ty::ParamEnvAnd<'tcx, ty::PolyTraitRef<'tcx>>, EvaluationResult>;
 
 /// The selection process begins by considering all impls, where
 /// clauses, and so forth that might resolve an obligation. Sometimes
 /// we'll be able to say definitively that (e.g.) an impl does not
 /// apply to the obligation: perhaps it is defined for `usize` but the
-/// obligation is for `int`. In that case, we drop the impl out of the
+/// obligation is for `i32`. In that case, we drop the impl out of the
 /// list. But the other cases are considered *candidates*.
 ///
 /// For selection to succeed, there must be exactly one matching
@@ -54,12 +43,14 @@ impl<'tcx> SelectionCache<'tcx> {
 /// will always be satisfied) picking the blanket impl will be wrong
 /// for at least *some* substitutions. To make this concrete, if we have
 ///
-///    trait AsDebug { type Out : fmt::Debug; fn debug(self) -> Self::Out; }
-///    impl<T: fmt::Debug> AsDebug for T {
-///        type Out = T;
-///        fn debug(self) -> fmt::Debug { self }
-///    }
-///    fn foo<T: AsDebug>(t: T) { println!("{:?}", <T as AsDebug>::debug(t)); }
+/// ```rust, ignore
+/// trait AsDebug { type Out: fmt::Debug; fn debug(self) -> Self::Out; }
+/// impl<T: fmt::Debug> AsDebug for T {
+///     type Out = T;
+///     fn debug(self) -> fmt::Debug { self }
+/// }
+/// fn foo<T: AsDebug>(t: T) { println!("{:?}", <T as AsDebug>::debug(t)); }
+/// ```
 ///
 /// we can't just use the impl to resolve the `<T as AsDebug>` obligation
 /// -- a type from another crate (that doesn't implement `fmt::Debug`) could
@@ -79,14 +70,16 @@ impl<'tcx> SelectionCache<'tcx> {
 /// inference variables. The can lead to inference making "leaps of logic",
 /// for example in this situation:
 ///
-///    pub trait Foo<T> { fn foo(&self) -> T; }
-///    impl<T> Foo<()> for T { fn foo(&self) { } }
-///    impl Foo<bool> for bool { fn foo(&self) -> bool { *self } }
+/// ```rust, ignore
+/// pub trait Foo<T> { fn foo(&self) -> T; }
+/// impl<T> Foo<()> for T { fn foo(&self) { } }
+/// impl Foo<bool> for bool { fn foo(&self) -> bool { *self } }
 ///
-///    pub fn foo<T>(t: T) where T: Foo<bool> {
-///       println!("{:?}", <T as Foo<_>>::foo(&t));
-///    }
-///    fn main() { foo(false); }
+/// pub fn foo<T>(t: T) where T: Foo<bool> {
+///     println!("{:?}", <T as Foo<_>>::foo(&t));
+/// }
+/// fn main() { foo(false); }
+/// ```
 ///
 /// Here the obligation `<T as Foo<$0>>` can be matched by both the blanket
 /// impl and the where-clause. We select the where-clause and unify `$0=bool`,
@@ -127,6 +120,9 @@ pub enum SelectionCandidate<'tcx> {
     /// Implementation of a `Fn`-family trait by one of the anonymous
     /// types generated for a fn pointer type (e.g., `fn(int) -> int`)
     FnPointerCandidate,
+
+    /// Builtin implementation of `DiscriminantKind`.
+    DiscriminantKindCandidate,
 
     TraitAliasCandidate(DefId),
 
@@ -255,77 +251,5 @@ pub struct OverflowError;
 impl<'tcx> From<OverflowError> for SelectionError<'tcx> {
     fn from(OverflowError: OverflowError) -> SelectionError<'tcx> {
         SelectionError::Overflow
-    }
-}
-
-#[derive(Clone, Default)]
-pub struct EvaluationCache<'tcx> {
-    pub hashmap: Lock<
-        FxHashMap<ty::ParamEnvAnd<'tcx, ty::PolyTraitRef<'tcx>>, WithDepNode<EvaluationResult>>,
-    >,
-}
-
-impl<'tcx> EvaluationCache<'tcx> {
-    /// Actually frees the underlying memory in contrast to what stdlib containers do on `clear`
-    pub fn clear(&self) {
-        *self.hashmap.borrow_mut() = Default::default();
-    }
-}
-
-#[derive(Clone, Eq, PartialEq)]
-pub struct WithDepNode<T> {
-    dep_node: DepNodeIndex,
-    cached_value: T,
-}
-
-impl<T: Clone> WithDepNode<T> {
-    pub fn new(dep_node: DepNodeIndex, cached_value: T) -> Self {
-        WithDepNode { dep_node, cached_value }
-    }
-
-    pub fn get(&self, tcx: TyCtxt<'_>) -> T {
-        tcx.dep_graph.read_index(self.dep_node);
-        self.cached_value.clone()
-    }
-}
-
-#[derive(Clone, Debug)]
-pub enum IntercrateAmbiguityCause {
-    DownstreamCrate { trait_desc: String, self_desc: Option<String> },
-    UpstreamCrateUpdate { trait_desc: String, self_desc: Option<String> },
-    ReservationImpl { message: String },
-}
-
-impl IntercrateAmbiguityCause {
-    /// Emits notes when the overlap is caused by complex intercrate ambiguities.
-    /// See #23980 for details.
-    pub fn add_intercrate_ambiguity_hint(&self, err: &mut rustc_errors::DiagnosticBuilder<'_>) {
-        err.note(&self.intercrate_ambiguity_hint());
-    }
-
-    pub fn intercrate_ambiguity_hint(&self) -> String {
-        match self {
-            &IntercrateAmbiguityCause::DownstreamCrate { ref trait_desc, ref self_desc } => {
-                let self_desc = if let &Some(ref ty) = self_desc {
-                    format!(" for type `{}`", ty)
-                } else {
-                    String::new()
-                };
-                format!("downstream crates may implement trait `{}`{}", trait_desc, self_desc)
-            }
-            &IntercrateAmbiguityCause::UpstreamCrateUpdate { ref trait_desc, ref self_desc } => {
-                let self_desc = if let &Some(ref ty) = self_desc {
-                    format!(" for type `{}`", ty)
-                } else {
-                    String::new()
-                };
-                format!(
-                    "upstream crates may add a new impl of trait `{}`{} \
-                     in future versions",
-                    trait_desc, self_desc
-                )
-            }
-            &IntercrateAmbiguityCause::ReservationImpl { ref message } => message.clone(),
-        }
     }
 }

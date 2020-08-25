@@ -1,27 +1,26 @@
 use std::mem;
 
-use rustc_ast::ast::{self, Ident, NodeId};
 use rustc_ast::attr;
-use rustc_ast::expand::is_proc_macro_attr;
 use rustc_ast::ptr::P;
 use rustc_ast::visit::{self, Visitor};
+use rustc_ast::{self as ast, NodeId};
 use rustc_ast_pretty::pprust;
-use rustc_expand::base::{ExtCtxt, Resolver};
+use rustc_expand::base::{ExtCtxt, ResolverExpand};
 use rustc_expand::expand::{AstFragment, ExpansionConfig};
-use rustc_session::parse::ParseSess;
+use rustc_session::Session;
 use rustc_span::hygiene::AstPass;
 use rustc_span::source_map::SourceMap;
-use rustc_span::symbol::{kw, sym};
+use rustc_span::symbol::{kw, sym, Ident, Symbol};
 use rustc_span::{Span, DUMMY_SP};
 use smallvec::smallvec;
 use std::cell::RefCell;
 
 struct ProcMacroDerive {
     id: NodeId,
-    trait_name: ast::Name,
+    trait_name: Symbol,
     function_name: Ident,
     span: Span,
-    attrs: Vec<ast::Name>,
+    attrs: Vec<Symbol>,
 }
 
 enum ProcMacroDefType {
@@ -42,6 +41,7 @@ enum ProcMacro {
 }
 
 struct CollectProcMacros<'a> {
+    sess: &'a Session,
     macros: Vec<ProcMacro>,
     in_root: bool,
     handler: &'a rustc_errors::Handler,
@@ -51,8 +51,8 @@ struct CollectProcMacros<'a> {
 }
 
 pub fn inject(
-    sess: &ParseSess,
-    resolver: &mut dyn Resolver,
+    sess: &Session,
+    resolver: &mut dyn ResolverExpand,
     mut krate: ast::Crate,
     is_proc_macro_crate: bool,
     has_proc_macro_decls: bool,
@@ -64,6 +64,7 @@ pub fn inject(
     let mut cx = ExtCtxt::new(sess, ecfg, resolver, None);
 
     let mut collect = CollectProcMacros {
+        sess,
         macros: Vec::new(),
         in_root: true,
         handler,
@@ -143,7 +144,7 @@ impl<'a> CollectProcMacros<'a> {
 
         let attributes_attr = list.get(1);
         let proc_attrs: Vec<_> = if let Some(attr) = attributes_attr {
-            if !attr.check_name(sym::attributes) {
+            if !attr.has_name(sym::attributes) {
                 self.handler.span_err(attr.span(), "second argument must be `attributes`")
             }
             attr.meta_item_list()
@@ -244,7 +245,7 @@ impl<'a> CollectProcMacros<'a> {
 impl<'a> Visitor<'a> for CollectProcMacros<'a> {
     fn visit_item(&mut self, item: &'a ast::Item) {
         if let ast::ItemKind::MacroDef(..) = item.kind {
-            if self.is_proc_macro_crate && attr::contains_name(&item.attrs, sym::macro_export) {
+            if self.is_proc_macro_crate && self.sess.contains_name(&item.attrs, sym::macro_export) {
                 let msg =
                     "cannot export macro_rules! macros from a `proc-macro` crate type currently";
                 self.handler.span_err(self.source_map.guess_head_span(item.span), msg);
@@ -263,7 +264,7 @@ impl<'a> Visitor<'a> for CollectProcMacros<'a> {
         let mut found_attr: Option<&'a ast::Attribute> = None;
 
         for attr in &item.attrs {
-            if is_proc_macro_attr(&attr) {
+            if self.sess.is_proc_macro_attr(&attr) {
                 if let Some(prev_attr) = found_attr {
                     let prev_item = prev_attr.get_normal_item();
                     let item = attr.get_normal_item();
@@ -331,11 +332,11 @@ impl<'a> Visitor<'a> for CollectProcMacros<'a> {
             return;
         }
 
-        if attr.check_name(sym::proc_macro_derive) {
+        if self.sess.check_name(attr, sym::proc_macro_derive) {
             self.collect_custom_derive(item, attr);
-        } else if attr.check_name(sym::proc_macro_attribute) {
+        } else if self.sess.check_name(attr, sym::proc_macro_attribute) {
             self.collect_attr_proc_macro(item);
-        } else if attr.check_name(sym::proc_macro) {
+        } else if self.sess.check_name(attr, sym::proc_macro) {
             self.collect_bang_proc_macro(item);
         };
 
@@ -384,12 +385,12 @@ fn mk_decls(
     let proc_macro = Ident::new(sym::proc_macro, span);
     let krate = cx.item(span, proc_macro, Vec::new(), ast::ItemKind::ExternCrate(None));
 
-    let bridge = cx.ident_of("bridge", span);
-    let client = cx.ident_of("client", span);
-    let proc_macro_ty = cx.ident_of("ProcMacro", span);
-    let custom_derive = cx.ident_of("custom_derive", span);
-    let attr = cx.ident_of("attr", span);
-    let bang = cx.ident_of("bang", span);
+    let bridge = Ident::new(sym::bridge, span);
+    let client = Ident::new(sym::client, span);
+    let proc_macro_ty = Ident::new(sym::ProcMacro, span);
+    let custom_derive = Ident::new(sym::custom_derive, span);
+    let attr = Ident::new(sym::attr, span);
+    let bang = Ident::new(sym::bang, span);
 
     let krate_ref = RefCell::new(ast_krate);
 
@@ -447,7 +448,7 @@ fn mk_decls(
     let decls_static = cx
         .item_static(
             span,
-            cx.ident_of("_DECLS", span),
+            Ident::new(sym::_DECLS, span),
             cx.ty_rptr(
                 span,
                 cx.ty(
@@ -480,7 +481,7 @@ fn mk_decls(
 
     let anon_constant = cx.item_const(
         span,
-        ast::Ident::new(kw::Underscore, span),
+        Ident::new(kw::Underscore, span),
         cx.ty(span, ast::TyKind::Tup(Vec::new())),
         block,
     );

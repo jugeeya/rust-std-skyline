@@ -1,10 +1,5 @@
-pub use CommentStyle::*;
-
-use crate::ast;
 use rustc_span::source_map::SourceMap;
-use rustc_span::{BytePos, CharPos, FileName, Pos};
-
-use log::debug;
+use rustc_span::{BytePos, CharPos, FileName, Pos, Symbol};
 
 #[cfg(test)]
 mod tests;
@@ -28,40 +23,9 @@ pub struct Comment {
     pub pos: BytePos,
 }
 
-pub fn is_line_doc_comment(s: &str) -> bool {
-    let res = (s.starts_with("///") && *s.as_bytes().get(3).unwrap_or(&b' ') != b'/')
-        || s.starts_with("//!");
-    debug!("is {:?} a doc comment? {}", s, res);
-    res
-}
-
-pub fn is_block_doc_comment(s: &str) -> bool {
-    // Prevent `/**/` from being parsed as a doc comment
-    let res = ((s.starts_with("/**") && *s.as_bytes().get(3).unwrap_or(&b' ') != b'*')
-        || s.starts_with("/*!"))
-        && s.len() >= 5;
-    debug!("is {:?} a doc comment? {}", s, res);
-    res
-}
-
-// FIXME(#64197): Try to privatize this again.
-pub fn is_doc_comment(s: &str) -> bool {
-    (s.starts_with("///") && is_line_doc_comment(s))
-        || s.starts_with("//!")
-        || (s.starts_with("/**") && is_block_doc_comment(s))
-        || s.starts_with("/*!")
-}
-
-pub fn doc_comment_style(comment: &str) -> ast::AttrStyle {
-    assert!(is_doc_comment(comment));
-    if comment.starts_with("//!") || comment.starts_with("/*!") {
-        ast::AttrStyle::Inner
-    } else {
-        ast::AttrStyle::Outer
-    }
-}
-
-pub fn strip_doc_comment_decoration(comment: &str) -> String {
+/// Makes a doc string more presentable to users.
+/// Used by rustdoc and perhaps other tools, but not by rustc.
+pub fn beautify_doc_string(data: Symbol) -> String {
     /// remove whitespace-only lines from the start/end of lines
     fn vertical_trim(lines: Vec<String>) -> Vec<String> {
         let mut i = 0;
@@ -123,26 +87,15 @@ pub fn strip_doc_comment_decoration(comment: &str) -> String {
         }
     }
 
-    // one-line comments lose their prefix
-    const ONELINERS: &[&str] = &["///!", "///", "//!", "//"];
-
-    for prefix in ONELINERS {
-        if comment.starts_with(*prefix) {
-            return (&comment[prefix.len()..]).to_string();
-        }
-    }
-
-    if comment.starts_with("/*") {
-        let lines =
-            comment[3..comment.len() - 2].lines().map(|s| s.to_string()).collect::<Vec<String>>();
-
+    let data = data.as_str();
+    if data.contains('\n') {
+        let lines = data.lines().map(|s| s.to_string()).collect::<Vec<String>>();
         let lines = vertical_trim(lines);
         let lines = horizontal_trim(lines);
-
-        return lines.join("\n");
+        lines.join("\n")
+    } else {
+        data.to_string()
     }
-
-    panic!("not a doc-comment: {}", comment);
 }
 
 /// Returns `None` if the first `col` chars of `s` contain a non-whitespace char.
@@ -200,7 +153,7 @@ pub fn gather_comments(sm: &SourceMap, path: FileName, src: String) -> Vec<Comme
 
     if let Some(shebang_len) = rustc_lexer::strip_shebang(text) {
         comments.push(Comment {
-            style: Isolated,
+            style: CommentStyle::Isolated,
             lines: vec![text[..shebang_len].to_string()],
             pos: start_bpos,
         });
@@ -216,23 +169,23 @@ pub fn gather_comments(sm: &SourceMap, path: FileName, src: String) -> Vec<Comme
                     while let Some(next_newline) = &token_text[idx + 1..].find('\n') {
                         idx = idx + 1 + next_newline;
                         comments.push(Comment {
-                            style: BlankLine,
+                            style: CommentStyle::BlankLine,
                             lines: vec![],
                             pos: start_bpos + BytePos((pos + idx) as u32),
                         });
                     }
                 }
             }
-            rustc_lexer::TokenKind::BlockComment { terminated: _ } => {
-                if !is_block_doc_comment(token_text) {
+            rustc_lexer::TokenKind::BlockComment { doc_style, .. } => {
+                if doc_style.is_none() {
                     let code_to_the_right = match text[pos + token.len..].chars().next() {
-                        Some('\r') | Some('\n') => false,
+                        Some('\r' | '\n') => false,
                         _ => true,
                     };
                     let style = match (code_to_the_left, code_to_the_right) {
-                        (true, true) | (false, true) => Mixed,
-                        (false, false) => Isolated,
-                        (true, false) => Trailing,
+                        (_, true) => CommentStyle::Mixed,
+                        (false, false) => CommentStyle::Isolated,
+                        (true, false) => CommentStyle::Trailing,
                     };
 
                     // Count the number of chars since the start of the line by rescanning.
@@ -245,10 +198,14 @@ pub fn gather_comments(sm: &SourceMap, path: FileName, src: String) -> Vec<Comme
                     comments.push(Comment { style, lines, pos: pos_in_file })
                 }
             }
-            rustc_lexer::TokenKind::LineComment => {
-                if !is_doc_comment(token_text) {
+            rustc_lexer::TokenKind::LineComment { doc_style } => {
+                if doc_style.is_none() {
                     comments.push(Comment {
-                        style: if code_to_the_left { Trailing } else { Isolated },
+                        style: if code_to_the_left {
+                            CommentStyle::Trailing
+                        } else {
+                            CommentStyle::Isolated
+                        },
                         lines: vec![token_text.to_string()],
                         pos: start_bpos + BytePos(pos as u32),
                     })

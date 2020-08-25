@@ -71,15 +71,19 @@ pub fn collect_lib_features(base_src_path: &Path) -> Features {
     lib_features
 }
 
-pub fn check(path: &Path, bad: &mut bool, verbose: bool) -> CollectedFeatures {
-    let mut features = collect_lang_features(path, bad);
+pub fn check(src_path: &Path, lib_path: &Path, bad: &mut bool, verbose: bool) -> CollectedFeatures {
+    let mut features = collect_lang_features(src_path, bad);
     assert!(!features.is_empty());
 
-    let lib_features = get_and_check_lib_features(path, bad, &features);
+    let lib_features = get_and_check_lib_features(lib_path, bad, &features);
     assert!(!lib_features.is_empty());
 
     super::walk_many(
-        &[&path.join("test/ui"), &path.join("test/ui-fulldeps"), &path.join("test/compile-fail")],
+        &[
+            &src_path.join("test/ui"),
+            &src_path.join("test/ui-fulldeps"),
+            &src_path.join("test/compile-fail"),
+        ],
         &mut |path| super::filter_dirs(path),
         &mut |entry, contents| {
             let file = entry.path();
@@ -444,10 +448,7 @@ fn map_lib_features(
                         level: Status::Unstable,
                         since: None,
                         has_gate_test: false,
-                        // FIXME(#57563): #57563 is now used as a common tracking issue,
-                        // although we would like to have specific tracking issues for each
-                        // `rustc_const_unstable` in the future.
-                        tracking_issue: NonZeroU32::new(57563),
+                        tracking_issue: find_attr_val(line, "issue").and_then(handle_issue_none),
                     };
                     mf(Ok((feature_name, feature)), file, i + 1);
                     continue;

@@ -18,6 +18,9 @@ endif
 HTMLDOCCK := '$(PYTHON)' '$(S)/src/etc/htmldocck.py'
 CGREP := "$(S)/src/etc/cat-and-grep.sh"
 
+# diff with common flags for multi-platform diffs against text output
+DIFF := diff -u --strip-trailing-cr
+
 # This is the name of the binary we will generate and run; use this
 # e.g. for `$(CC) -o $(RUN_BINFILE)`.
 RUN_BINFILE = $(TMPDIR)/$(1)
@@ -44,8 +47,14 @@ RUN = PATH="$(PATH):$(TARGET_RPATH_DIR)" $(RUN_BINFILE)
 FAIL = PATH="$(PATH):$(TARGET_RPATH_DIR)" $(RUN_BINFILE) && exit 1 || exit 0
 DYLIB_GLOB = $(1)*.dll
 DYLIB = $(TMPDIR)/$(1).dll
+ifdef IS_MSVC
 STATICLIB = $(TMPDIR)/$(1).lib
 STATICLIB_GLOB = $(1)*.lib
+else
+IMPLIB = $(TMPDIR)/lib$(1).dll.a
+STATICLIB = $(TMPDIR)/lib$(1).a
+STATICLIB_GLOB = lib$(1)*.a
+endif
 BIN = $(1).exe
 LLVM_FILECHECK := $(shell cygpath -u "$(LLVM_FILECHECK)")
 else
@@ -145,7 +154,7 @@ ifdef IS_MSVC
 	$(CC) $< -link -dll -out:`cygpath -w $@`
 else
 %.dll: lib%.o
-	$(CC) -o $@ $< -shared
+	$(CC) -o $@ $< -shared -Wl,--out-implib=$@.a
 endif
 
 $(TMPDIR)/lib%.o: %.c

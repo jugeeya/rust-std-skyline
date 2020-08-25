@@ -94,7 +94,6 @@
 
 use std::cmp;
 use std::collections::hash_map::Entry;
-use std::sync::Arc;
 
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::sync;
@@ -162,7 +161,7 @@ where
 
     // Next we try to make as many symbols "internal" as possible, so LLVM has
     // more freedom to optimize.
-    if !tcx.sess.opts.cg.link_dead_code {
+    if tcx.sess.opts.cg.link_dead_code != Some(true) {
         let _prof_timer = tcx.prof.generic_activity("cgu_partitioning_internalize_symbols");
         internalize_symbols(tcx, &mut post_inlining, inlining_map);
     }
@@ -307,7 +306,7 @@ fn mono_item_visibility(
             let def_id = tcx.hir().local_def_id(*hir_id);
             return if tcx.is_reachable_non_generic(def_id) {
                 *can_be_internalized = false;
-                default_visibility(tcx, def_id, false)
+                default_visibility(tcx, def_id.to_def_id(), false)
             } else {
                 Visibility::Hidden
             };
@@ -315,7 +314,8 @@ fn mono_item_visibility(
     };
 
     let def_id = match instance.def {
-        InstanceDef::Item(def_id) | InstanceDef::DropGlue(def_id, Some(_)) => def_id,
+        InstanceDef::Item(def) => def.did,
+        InstanceDef::DropGlue(def_id, Some(_)) => def_id,
 
         // These are all compiler glue and such, never exported, always hidden.
         InstanceDef::VtableShim(..)
@@ -455,17 +455,10 @@ fn default_visibility(tcx: TyCtxt<'_>, id: DefId, is_generic: bool) -> Visibilit
 fn merge_codegen_units<'tcx>(
     tcx: TyCtxt<'tcx>,
     initial_partitioning: &mut PreInliningPartitioning<'tcx>,
-    mut target_cgu_count: usize,
+    target_cgu_count: usize,
 ) {
     assert!(target_cgu_count >= 1);
     let codegen_units = &mut initial_partitioning.codegen_units;
-
-    if tcx.is_compiler_builtins(LOCAL_CRATE) {
-        // Compiler builtins require some degree of control over how mono items
-        // are partitioned into compilation units. Provide it by keeping the
-        // original partitioning when compiling the compiler builtins crate.
-        target_cgu_count = codegen_units.len();
-    }
 
     // Note that at this point in time the `codegen_units` here may not be in a
     // deterministic order (but we know they're deterministically the same set).
@@ -712,7 +705,7 @@ fn characteristic_def_id_of_mono_item<'tcx>(
     match mono_item {
         MonoItem::Fn(instance) => {
             let def_id = match instance.def {
-                ty::InstanceDef::Item(def_id) => def_id,
+                ty::InstanceDef::Item(def) => def.did,
                 ty::InstanceDef::VtableShim(..)
                 | ty::InstanceDef::ReifyShim(..)
                 | ty::InstanceDef::FnPtrShim(..)
@@ -756,7 +749,7 @@ fn characteristic_def_id_of_mono_item<'tcx>(
             Some(def_id)
         }
         MonoItem::Static(def_id) => Some(def_id),
-        MonoItem::GlobalAsm(hir_id) => Some(tcx.hir().local_def_id(hir_id)),
+        MonoItem::GlobalAsm(hir_id) => Some(tcx.hir().local_def_id(hir_id).to_def_id()),
     }
 }
 
@@ -780,7 +773,7 @@ fn compute_codegen_unit_name(
                 cgu_def_id = Some(DefId { krate: def_id.krate, index: CRATE_DEF_INDEX });
             }
             break;
-        } else if tcx.def_kind(current_def_id) == Some(DefKind::Mod) {
+        } else if tcx.def_kind(current_def_id) == DefKind::Mod {
             if cgu_def_id.is_none() {
                 cgu_def_id = Some(current_def_id);
             }
@@ -825,7 +818,7 @@ where
             debug!("CodegenUnit {} estimated size {} :", cgu.name(), cgu.size_estimate());
 
             for (mono_item, linkage) in cgu.items() {
-                let symbol_name = mono_item.symbol_name(tcx).name.as_str();
+                let symbol_name = mono_item.symbol_name(tcx).name;
                 let symbol_hash_start = symbol_name.rfind('h');
                 let symbol_hash =
                     symbol_hash_start.map(|i| &symbol_name[i..]).unwrap_or("<no hash>");
@@ -888,9 +881,9 @@ where
 }
 
 fn collect_and_partition_mono_items(
-    tcx: TyCtxt<'_>,
+    tcx: TyCtxt<'tcx>,
     cnum: CrateNum,
-) -> (Arc<DefIdSet>, Arc<Vec<Arc<CodegenUnit<'_>>>>) {
+) -> (&'tcx DefIdSet, &'tcx [CodegenUnit<'tcx>]) {
     assert_eq!(cnum, LOCAL_CRATE);
 
     let collection_mode = match tcx.sess.opts.debugging_opts.print_mono_items {
@@ -913,7 +906,7 @@ fn collect_and_partition_mono_items(
             }
         }
         None => {
-            if tcx.sess.opts.cg.link_dead_code {
+            if tcx.sess.opts.cg.link_dead_code == Some(true) {
                 MonoItemCollectionMode::Eager
             } else {
                 MonoItemCollectionMode::Lazy
@@ -928,10 +921,12 @@ fn collect_and_partition_mono_items(
     let (codegen_units, _) = tcx.sess.time("partition_and_assert_distinct_symbols", || {
         sync::join(
             || {
-                partition(tcx, items.iter().cloned(), tcx.sess.codegen_units(), &inlining_map)
-                    .into_iter()
-                    .map(Arc::new)
-                    .collect::<Vec<_>>()
+                &*tcx.arena.alloc_from_iter(partition(
+                    tcx,
+                    items.iter().cloned(),
+                    tcx.sess.codegen_units(),
+                    &inlining_map,
+                ))
             },
             || assert_symbols_are_distinct(tcx, items.iter()),
         )
@@ -949,7 +944,7 @@ fn collect_and_partition_mono_items(
     if tcx.sess.opts.debugging_opts.print_mono_items.is_some() {
         let mut item_to_cgus: FxHashMap<_, Vec<_>> = Default::default();
 
-        for cgu in &codegen_units {
+        for cgu in codegen_units {
             for (&mono_item, &linkage) in cgu.items() {
                 item_to_cgus.entry(mono_item).or_default().push((cgu.name(), linkage));
             }
@@ -997,10 +992,10 @@ fn collect_and_partition_mono_items(
         }
     }
 
-    (Arc::new(mono_items), Arc::new(codegen_units))
+    (tcx.arena.alloc(mono_items), codegen_units)
 }
 
-pub fn provide(providers: &mut Providers<'_>) {
+pub fn provide(providers: &mut Providers) {
     providers.collect_and_partition_mono_items = collect_and_partition_mono_items;
 
     providers.is_codegened_item = |tcx, def_id| {
@@ -1012,7 +1007,6 @@ pub fn provide(providers: &mut Providers<'_>) {
         let (_, all) = tcx.collect_and_partition_mono_items(LOCAL_CRATE);
         all.iter()
             .find(|cgu| cgu.name() == name)
-            .cloned()
             .unwrap_or_else(|| panic!("failed to find cgu with name {:?}", name))
     };
 }
