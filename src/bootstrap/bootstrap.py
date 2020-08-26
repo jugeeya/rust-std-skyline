@@ -966,7 +966,7 @@ def bootstrap(help_triggered):
     else:
         build.set_normal_environment()
 
-    build.update_submodules()
+    # build.update_submodules()
 
     # Fetch/build the bootstrap
     build.build = args.build or build.build_triple()
